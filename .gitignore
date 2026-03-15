@@ -1,0 +1,21 @@
+# Build artifacts
+mlsys
+*.o
+*.zip
+
+# Output files
+output*.json
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Third party (download separately)
+third_party/json.hpp
