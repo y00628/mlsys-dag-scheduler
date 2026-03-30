@@ -35,7 +35,7 @@ void WriteSolution(const Solution& solution, const std::string& filename) {
         subgraph_latencies_arr.push_back(sg.subgraph_latency);
     }
 
-    j["op_ids"] = op_ids_arr;
+    j["subgraphs"] = op_ids_arr;
     j["tensors_to_retain"] = tensors_to_retain_arr;
     j["granularities"] = granularities_arr;
     j["traversal_orders"] = traversal_orders_arr;

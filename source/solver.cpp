@@ -88,8 +88,9 @@ Solution NaiveBaseline(const Problem& problem) {
         // Don't retain anything — every tensor goes back to slow memory
         sg.tensors_to_retain = {};
 
-        // TODO: compute actual latency
-        sg.subgraph_latency = 0.0;
+        // Basic placeholder latency: use base_cost so output remains sane.
+        // TODO: replace with scorer-aligned latency computation.
+        sg.subgraph_latency = static_cast<double>(op.base_cost);
 
         sol.subgraphs.push_back(std::move(sg));
     }
