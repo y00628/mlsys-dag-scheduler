@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "evaluator.h"
+
 namespace mlsys {
 
 namespace {
@@ -70,17 +72,13 @@ Solution NaiveBaseline(const Problem& problem) {
         const auto& op = problem.ops[op_idx];
         Subgraph sg;
         sg.op_ids = {op_idx};
-        sg.granularity = problem.native_granularity;
+        sg.granularity.width = std::min<Width>(problem.native_granularity.width, 32);
+        sg.granularity.height = std::min<Height>(problem.native_granularity.height, 32);
 
         // For MatMul, set depth = native width (full reduction in one step for now).
-        // TODO: compute proper depth from the inner dimension of the matmul.
+        // We keep a conservative depth so the current baseline fits more benchmarks.
         if (op.op_type == "MatMul" && op.inputs.size() == 2) {
-            // Inner dimension K = width of right input (or height of left input).
-            // For a standard MatMul: Left[M x K] * Right[K x N] = Out[M x N]
-            // K = width of the left input = height of the right input
-            // We'll use the width of the right input tensor as K for now.
-            auto k_dim = problem.tensors[op.inputs[1]].height;
-            sg.granularity.depth = k_dim;  // full reduction, no split-k
+            sg.granularity.depth = std::min<Depth>(problem.native_granularity.depth, 32);
         } else {
             sg.granularity.depth = 1;  // Pointwise: k is irrelevant
         }
@@ -88,11 +86,12 @@ Solution NaiveBaseline(const Problem& problem) {
         // Don't retain anything — every tensor goes back to slow memory
         sg.tensors_to_retain = {};
 
-        // Basic placeholder latency: use base_cost so output remains sane.
-        // TODO: replace with scorer-aligned latency computation.
-        sg.subgraph_latency = static_cast<double>(op.base_cost);
-
         sol.subgraphs.push_back(std::move(sg));
+    }
+
+    auto latencies = ComputeSubgraphLatencies(problem, sol);
+    for (size_t i = 0; i < sol.subgraphs.size() && i < latencies.size(); ++i) {
+        sol.subgraphs[i].subgraph_latency = latencies[i];
     }
 
     return sol;
