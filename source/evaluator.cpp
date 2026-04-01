@@ -2,402 +2,787 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <limits>
-#include <optional>
 #include <queue>
 #include <set>
-#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace mlsys {
 
 namespace {
 
-int64_t CeilDiv(int64_t a, int64_t b) {
-    return (a + b - 1) / b;
+struct OpGraph {
+    std::vector<int> producer_of_tensor;
+    std::vector<std::vector<size_t>> consumers_of_tensor;
+    std::vector<std::vector<size_t>> preds;
+    std::vector<std::vector<size_t>> succs;
+    std::vector<size_t> topo_order;
+    std::vector<size_t> topo_pos;
+};
+
+struct BoundaryInfo {
+    std::vector<size_t> boundary_inputs;
+    std::vector<size_t> boundary_outputs;
+    std::vector<size_t> internal_tensors;
+};
+
+struct ResidentSlice {
+    int64_t bytes = 0;
+    int64_t last_used = 0;
+};
+
+struct SliceKey {
+    size_t tensor_id = 0;
+    int kind = 0;
+    int64_t row = 0;
+    int64_t col = 0;
+    int64_t k_begin = 0;
+
+    bool operator==(const SliceKey& other) const {
+        return tensor_id == other.tensor_id && kind == other.kind &&
+               row == other.row && col == other.col && k_begin == other.k_begin;
+    }
+};
+
+struct SliceKeyHash {
+    size_t operator()(const SliceKey& key) const {
+        size_t h = std::hash<size_t>{}(key.tensor_id);
+        h ^= std::hash<int>{}(key.kind) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(key.row) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(key.col) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(key.k_begin) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct StepRequirement {
+    std::unordered_map<SliceKey, int64_t, SliceKeyHash> slices;
+    double compute_cost = 0.0;
+    int64_t output_active_bytes = 0;
+    int64_t output_write_bytes = 0;
+    std::vector<size_t> retained_outputs_completed;
+};
+
+int64_t CeilDiv(int64_t value, int64_t divisor) {
+    if (divisor <= 0) {
+        return 0;
+    }
+    return (value + divisor - 1) / divisor;
 }
 
-int64_t TileWidth(Width tensor_w, Width gran_w, size_t col_idx) {
-    const int64_t start = static_cast<int64_t>(col_idx) * gran_w;
-    return std::min<int64_t>(gran_w, tensor_w - start);
+int64_t TensorBytes(const Tensor& tensor) {
+    return tensor.width * tensor.height;
 }
 
-int64_t TileHeight(Height tensor_h, Height gran_h, size_t row_idx) {
-    const int64_t start = static_cast<int64_t>(row_idx) * gran_h;
-    return std::min<int64_t>(gran_h, tensor_h - start);
+bool IsMatMul(const Op& op) {
+    return op.op_type == "MatMul";
 }
 
-std::vector<size_t> TopologicalOrder(const Problem& problem,
-                                     const std::unordered_set<size_t>& op_set) {
-    std::unordered_map<size_t, std::vector<size_t>> tensor_to_consumers;
-    for (size_t op_id : op_set) {
-        for (size_t input_tensor : problem.ops[op_id].inputs) {
-            tensor_to_consumers[input_tensor].push_back(op_id);
+bool IsPointwise(const Op& op) {
+    return op.op_type == "Pointwise";
+}
+
+int64_t MatMulK(const Problem& problem, size_t op_id) {
+    const auto& op = problem.ops[op_id];
+    if (op.inputs.size() < 2) {
+        return 1;
+    }
+    return std::max<int64_t>(1, problem.tensors[op.inputs[0]].width);
+}
+
+OpGraph BuildOpGraph(const Problem& problem) {
+    OpGraph graph;
+    graph.producer_of_tensor.assign(problem.tensors.size(), -1);
+    graph.consumers_of_tensor.assign(problem.tensors.size(), {});
+
+    for (size_t op_id = 0; op_id < problem.ops.size(); ++op_id) {
+        for (size_t tensor_id : problem.ops[op_id].outputs) {
+            graph.producer_of_tensor[tensor_id] = static_cast<int>(op_id);
+        }
+        for (size_t tensor_id : problem.ops[op_id].inputs) {
+            graph.consumers_of_tensor[tensor_id].push_back(op_id);
         }
     }
 
-    std::unordered_map<size_t, int> in_degree;
-    for (size_t op_id : op_set) {
-        in_degree[op_id] = 0;
-    }
-    for (size_t op_id : op_set) {
-        for (size_t out_tensor : problem.ops[op_id].outputs) {
-            auto it = tensor_to_consumers.find(out_tensor);
-            if (it == tensor_to_consumers.end()) continue;
-            for (size_t consumer : it->second) {
-                if (consumer != op_id) {
-                    ++in_degree[consumer];
-                }
+    graph.preds.assign(problem.ops.size(), {});
+    graph.succs.assign(problem.ops.size(), {});
+    std::vector<int> indegree(problem.ops.size(), 0);
+    for (size_t op_id = 0; op_id < problem.ops.size(); ++op_id) {
+        for (size_t tensor_id : problem.ops[op_id].inputs) {
+            int producer = graph.producer_of_tensor[tensor_id];
+            if (producer >= 0) {
+                graph.preds[op_id].push_back(static_cast<size_t>(producer));
+                graph.succs[producer].push_back(op_id);
+                indegree[op_id]++;
             }
         }
     }
 
     std::queue<size_t> q;
-    for (auto& [op_id, deg] : in_degree) {
-        if (deg == 0) q.push(op_id);
+    for (size_t i = 0; i < problem.ops.size(); ++i) {
+        if (indegree[i] == 0) {
+            q.push(i);
+        }
     }
 
-    std::vector<size_t> order;
-    order.reserve(op_set.size());
     while (!q.empty()) {
-        size_t u = q.front();
+        size_t op_id = q.front();
         q.pop();
-        order.push_back(u);
-
-        for (size_t out_tensor : problem.ops[u].outputs) {
-            auto it = tensor_to_consumers.find(out_tensor);
-            if (it == tensor_to_consumers.end()) continue;
-            for (size_t v : it->second) {
-                if (v == u) continue;
-                if (--in_degree[v] == 0) {
-                    q.push(v);
-                }
+        graph.topo_order.push_back(op_id);
+        for (size_t succ : graph.succs[op_id]) {
+            if (--indegree[succ] == 0) {
+                q.push(succ);
             }
         }
     }
 
-    return order;
+    graph.topo_pos.assign(problem.ops.size(), 0);
+    for (size_t i = 0; i < graph.topo_order.size(); ++i) {
+        graph.topo_pos[graph.topo_order[i]] = i;
+    }
+
+    return graph;
 }
 
-struct SliceInfo {
-    int64_t transfer_bytes = 0;
-    int64_t resident_bytes = 0;
-    bool pinned = false;
-    int64_t last_used = 0;
-};
-
-std::string MakeKey(size_t tensor_id, const std::string& role, size_t a, size_t b) {
-    return std::to_string(tensor_id) + ":" + role + ":" + std::to_string(a) + ":" +
-           std::to_string(b);
+std::vector<size_t> TopoSortSubset(const OpGraph& graph,
+                                   const std::vector<size_t>& ops) {
+    std::vector<size_t> ordered = ops;
+    std::sort(ordered.begin(), ordered.end(),
+              [&](size_t lhs, size_t rhs) {
+                  return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+              });
+    return ordered;
 }
 
-std::string MakeKey(size_t tensor_id, const std::string& role, size_t a) {
-    return std::to_string(tensor_id) + ":" + role + ":" + std::to_string(a);
+bool SharesCommonOutputShape(const Problem& problem,
+                             const std::vector<size_t>& ordered_ops) {
+    if (ordered_ops.empty()) {
+        return false;
+    }
+    const auto& ref_tensor =
+        problem.tensors[problem.ops[ordered_ops.front()].outputs.front()];
+    for (size_t op_id : ordered_ops) {
+        if (problem.ops[op_id].outputs.size() != 1) {
+            return false;
+        }
+        const auto& tensor = problem.tensors[problem.ops[op_id].outputs.front()];
+        if (tensor.width != ref_tensor.width || tensor.height != ref_tensor.height) {
+            return false;
+        }
+    }
+    return true;
 }
 
-struct TensorRoleMask {
-    bool pointwise = false;
-    bool lhs = false;
-    bool rhs = false;
-};
+bool IsConnectedSubgraph(const OpGraph& graph, const std::vector<size_t>& ops) {
+    if (ops.empty()) {
+        return false;
+    }
+    if (ops.size() == 1) {
+        return true;
+    }
 
-std::vector<size_t> TileTraversal(size_t rows, size_t cols,
-                                  const std::optional<TraversalOrder>& traversal_order) {
-    std::vector<size_t> order;
-    const size_t total = rows * cols;
-    order.reserve(total);
+    std::unordered_set<size_t> op_set(ops.begin(), ops.end());
+    std::unordered_set<size_t> visited;
+    std::queue<size_t> q;
+    q.push(ops.front());
+    visited.insert(ops.front());
 
-    if (traversal_order.has_value() && !traversal_order->empty()) {
-        for (int64_t idx : traversal_order.value()) {
-            if (idx >= 0 && static_cast<size_t>(idx) < total) {
-                order.push_back(static_cast<size_t>(idx));
+    while (!q.empty()) {
+        size_t op_id = q.front();
+        q.pop();
+        for (size_t succ : graph.succs[op_id]) {
+            if (op_set.count(succ) && !visited.count(succ)) {
+                visited.insert(succ);
+                q.push(succ);
+            }
+        }
+        for (size_t pred : graph.preds[op_id]) {
+            if (op_set.count(pred) && !visited.count(pred)) {
+                visited.insert(pred);
+                q.push(pred);
             }
         }
     }
 
-    if (order.size() != total) {
-        order.clear();
-        for (size_t i = 0; i < total; ++i) order.push_back(i);
-    }
-
-    return order;
+    return visited.size() == ops.size();
 }
 
-double EstimateSubgraphLatency(const Problem& problem, const Solution& solution,
-                               const Subgraph& sg,
-                               const std::unordered_set<size_t>& retained_from_prev,
-                               std::unordered_set<size_t>& retained_after) {
-    (void)retained_from_prev;
-    (void)solution;
+BoundaryInfo ComputeBoundaryInfo(const Problem& problem, const OpGraph& graph,
+                                 const std::vector<size_t>& ordered_ops) {
+    BoundaryInfo info;
+    std::unordered_set<size_t> op_set(ordered_ops.begin(), ordered_ops.end());
+    std::unordered_set<size_t> boundary_inputs;
+    std::unordered_set<size_t> boundary_outputs;
+    std::unordered_set<size_t> internal_tensors;
 
-    if (sg.op_ids.empty()) {
-        retained_after.clear();
-        return 0.0;
-    }
-
-    std::unordered_set<size_t> op_set(sg.op_ids.begin(), sg.op_ids.end());
-    auto topo = TopologicalOrder(problem, op_set);
-    if (topo.size() != op_set.size()) {
-        std::cerr << "WARNING: subgraph is not a DAG or not connected properly\n";
-        return -1.0;
-    }
-
-    // Determine tensors produced inside the subgraph and which of them are external outputs.
-    std::unordered_set<size_t> produced_inside;
-    std::unordered_set<size_t> consumed_inside;
-    for (size_t op_id : op_set) {
-        for (size_t t : problem.ops[op_id].outputs) produced_inside.insert(t);
-        for (size_t t : problem.ops[op_id].inputs) consumed_inside.insert(t);
-    }
-
-    std::unordered_set<size_t> external_inputs;
-    std::unordered_set<size_t> external_outputs;
-    std::unordered_map<size_t, TensorRoleMask> input_roles;
-
-    for (size_t op_id : topo) {
-        const auto& op = problem.ops[op_id];
-        for (size_t input_idx = 0; input_idx < op.inputs.size(); ++input_idx) {
-            size_t t = op.inputs[input_idx];
-            if (!produced_inside.count(t)) {
-                external_inputs.insert(t);
-                auto& mask = input_roles[t];
-                if (op.op_type == "MatMul") {
-                    if (input_idx == 0) mask.lhs = true;
-                    if (input_idx == 1) mask.rhs = true;
-                } else {
-                    mask.pointwise = true;
-                }
+    for (size_t op_id : ordered_ops) {
+        for (size_t tensor_id : problem.ops[op_id].inputs) {
+            int producer = graph.producer_of_tensor[tensor_id];
+            if (producer < 0 || !op_set.count(static_cast<size_t>(producer))) {
+                boundary_inputs.insert(tensor_id);
+            } else {
+                internal_tensors.insert(tensor_id);
             }
         }
-        for (size_t out_t : op.outputs) {
-            bool consumed_outside = false;
-            for (size_t consumer_id = 0; consumer_id < problem.ops.size(); ++consumer_id) {
-                if (op_set.count(consumer_id)) continue;
-                const auto& consumer = problem.ops[consumer_id];
-                if (std::find(consumer.inputs.begin(), consumer.inputs.end(), out_t) !=
-                    consumer.inputs.end()) {
-                    consumed_outside = true;
+        for (size_t tensor_id : problem.ops[op_id].outputs) {
+            bool escapes = graph.consumers_of_tensor[tensor_id].empty();
+            for (size_t consumer : graph.consumers_of_tensor[tensor_id]) {
+                if (!op_set.count(consumer)) {
+                    escapes = true;
                     break;
                 }
             }
-            if (consumed_outside || std::find(problem.graph_outputs.begin(), problem.graph_outputs.end(), out_t) != problem.graph_outputs.end()) {
-                external_outputs.insert(out_t);
+            if (escapes) {
+                boundary_outputs.insert(tensor_id);
             }
         }
     }
 
-    const auto& first_op = problem.ops[topo.front()];
-    const Tensor& first_out_tensor = problem.tensors[first_op.outputs.front()];
-    const size_t rows = static_cast<size_t>(CeilDiv(first_out_tensor.height, sg.granularity.height));
-    const size_t cols = static_cast<size_t>(CeilDiv(first_out_tensor.width, sg.granularity.width));
-    const auto tile_order = TileTraversal(rows, cols, sg.traversal_order);
+    info.boundary_inputs.assign(boundary_inputs.begin(), boundary_inputs.end());
+    info.boundary_outputs.assign(boundary_outputs.begin(), boundary_outputs.end());
+    info.internal_tensors.assign(internal_tensors.begin(), internal_tensors.end());
 
-    struct CacheEntry {
-        SliceInfo info;
-    };
+    std::sort(info.boundary_inputs.begin(), info.boundary_inputs.end());
+    std::sort(info.boundary_outputs.begin(), info.boundary_outputs.end());
+    std::sort(info.internal_tensors.begin(), info.internal_tensors.end());
 
-    std::unordered_map<std::string, CacheEntry> cache;
-    int64_t resident_bytes = 0;
+    return info;
+}
 
-    auto ensure_capacity = [&](int64_t needed, const std::unordered_set<std::string>& keep) -> bool {
-        while (resident_bytes + needed > problem.fast_memory_capacity) {
-            std::string victim;
-            int64_t oldest = std::numeric_limits<int64_t>::max();
-            for (const auto& [key, entry] : cache) {
-                if (keep.count(key) || entry.info.pinned) continue;
-                if (entry.info.last_used < oldest) {
-                    oldest = entry.info.last_used;
-                    victim = key;
-                }
-            }
-            if (victim.empty()) return false;
-            resident_bytes -= cache[victim].info.resident_bytes;
-            cache.erase(victim);
-        }
+bool ValidateTraversalOrder(size_t spatial_tiles,
+                            const std::optional<TraversalOrder>& traversal) {
+    if (!traversal.has_value()) {
         return true;
+    }
+    if (traversal->size() != spatial_tiles) {
+        return false;
+    }
+    std::vector<int> seen(spatial_tiles, 0);
+    for (int64_t idx : traversal.value()) {
+        if (idx < 0 || idx >= static_cast<int64_t>(spatial_tiles)) {
+            return false;
+        }
+        if (seen[idx]++) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<size_t> BuildTraversal(size_t spatial_tiles,
+                                   const std::optional<TraversalOrder>& traversal) {
+    std::vector<size_t> order;
+    order.reserve(spatial_tiles);
+    if (!traversal.has_value()) {
+        for (size_t i = 0; i < spatial_tiles; ++i) {
+            order.push_back(i);
+        }
+        return order;
+    }
+    for (int64_t value : traversal.value()) {
+        order.push_back(static_cast<size_t>(value));
+    }
+    return order;
+}
+
+bool CompareResidentUsage(
+    const std::pair<SliceKey, ResidentSlice>& lhs,
+    const std::pair<SliceKey, ResidentSlice>& rhs) {
+    return lhs.second.last_used < rhs.second.last_used;
+}
+
+bool EnsureCapacity(
+    int64_t capacity, int64_t base_bytes, int64_t output_active_bytes,
+    const std::unordered_set<SliceKey, SliceKeyHash>& required_now,
+    std::unordered_map<SliceKey, ResidentSlice, SliceKeyHash>* resident,
+    int64_t incoming_new_bytes) {
+    auto resident_total = [&]() {
+        int64_t total = 0;
+        for (const auto& [_, slice] : *resident) {
+            total += slice.bytes;
+        }
+        return total;
     };
 
-    double total = 0.0;
-    int64_t access_clock = 0;
-
-    for (size_t tile_idx : tile_order) {
-        const size_t row = tile_idx / cols;
-        const size_t col = tile_idx % cols;
-        const int64_t tile_w = TileWidth(first_out_tensor.width, sg.granularity.width, col);
-        const int64_t tile_h = TileHeight(first_out_tensor.height, sg.granularity.height, row);
-
-        std::unordered_set<std::string> keep_this_tile;
-        int64_t memory_cost = 0;
-
-        // Boundary inputs: load slices once per tile if not already resident.
-        for (size_t t : external_inputs) {
-            const auto& roles = input_roles[t];
-            const auto& tensor = problem.tensors[t];
-            const int64_t k_total = tensor.width;  // width = columns, height = rows.
-            if (roles.lhs) {
-                std::string key = MakeKey(t, "lhs", row);
-                int64_t transfer_bytes = tile_h * k_total;
-                int64_t resident = tile_h * std::min<int64_t>(sg.granularity.depth, k_total);
-                if (!cache.count(key)) {
-                    if (!ensure_capacity(resident, keep_this_tile)) return -1.0;
-                    cache[key] = CacheEntry{{transfer_bytes, resident, false, ++access_clock}};
-                    resident_bytes += resident;
-                    memory_cost += static_cast<int64_t>(std::ceil(static_cast<double>(transfer_bytes) /
-                                                                 problem.slow_memory_bandwidth));
-                } else {
-                    cache[key].info.last_used = ++access_clock;
-                }
-                keep_this_tile.insert(key);
-            }
-            if (roles.rhs) {
-                std::string key = MakeKey(t, "rhs", col);
-                int64_t transfer_bytes = k_total * tile_w;
-                int64_t resident = std::min<int64_t>(sg.granularity.depth, k_total) * tile_w;
-                if (!cache.count(key)) {
-                    if (!ensure_capacity(resident, keep_this_tile)) return -1.0;
-                    cache[key] = CacheEntry{{transfer_bytes, resident, false, ++access_clock}};
-                    resident_bytes += resident;
-                    memory_cost += static_cast<int64_t>(std::ceil(static_cast<double>(transfer_bytes) /
-                                                                 problem.slow_memory_bandwidth));
-                } else {
-                    cache[key].info.last_used = ++access_clock;
-                }
-                keep_this_tile.insert(key);
-            }
-            if (roles.pointwise) {
-                std::string key = MakeKey(t, "pw", row, col);
-                int64_t transfer_bytes = tile_w * tile_h;
-                int64_t resident = transfer_bytes;
-                if (!cache.count(key)) {
-                    if (!ensure_capacity(resident, keep_this_tile)) return -1.0;
-                    cache[key] = CacheEntry{{transfer_bytes, resident, false, ++access_clock}};
-                    resident_bytes += resident;
-                    memory_cost += static_cast<int64_t>(std::ceil(static_cast<double>(transfer_bytes) /
-                                                                 problem.slow_memory_bandwidth));
-                } else {
-                    cache[key].info.last_used = ++access_clock;
-                }
-                keep_this_tile.insert(key);
+    while (base_bytes + output_active_bytes + resident_total() + incoming_new_bytes >
+           capacity) {
+        std::vector<std::pair<SliceKey, ResidentSlice>> evictable;
+        for (const auto& entry : *resident) {
+            if (!required_now.count(entry.first)) {
+                evictable.push_back(entry);
             }
         }
+        if (evictable.empty()) {
+            return false;
+        }
+        auto victim = std::min_element(evictable.begin(), evictable.end(),
+                                       CompareResidentUsage);
+        resident->erase(victim->first);
+    }
+    return true;
+}
 
-        // External outputs: write slices unless retained.
-        for (size_t out_t : external_outputs) {
-            bool retain = std::find(sg.tensors_to_retain.begin(), sg.tensors_to_retain.end(), out_t) !=
-                          sg.tensors_to_retain.end();
-            if (retain) {
-                retained_after.insert(out_t);
+StepRequirement BuildStepRequirement(
+    const Problem& problem, const OpGraph& graph,
+    const std::vector<size_t>& ordered_ops, const BoundaryInfo& boundary,
+    const Granularity& granularity, const std::unordered_set<size_t>& retained_prev,
+    const std::unordered_set<size_t>& retained_now, int64_t row_tile,
+    int64_t col_tile, int64_t actual_h, int64_t actual_w, int64_t k_begin,
+    int64_t k_step, int64_t step_index, int64_t max_k_steps) {
+    StepRequirement requirement;
+    std::unordered_set<size_t> op_set(ordered_ops.begin(), ordered_ops.end());
+    std::unordered_set<size_t> boundary_outputs(boundary.boundary_outputs.begin(),
+                                                boundary.boundary_outputs.end());
+
+    const int64_t native_w = std::max<int64_t>(1, problem.native_granularity.width);
+    const int64_t native_h = std::max<int64_t>(1, problem.native_granularity.height);
+    const int64_t native_k = std::max<int64_t>(1, problem.native_granularity.depth);
+    const double spatial_factor =
+        static_cast<double>(CeilDiv(granularity.width, native_w) *
+                            CeilDiv(granularity.height, native_h));
+
+    for (size_t op_id : ordered_ops) {
+        const auto& op = problem.ops[op_id];
+        const bool final_k_step = (step_index == max_k_steps - 1);
+
+        if (IsPointwise(op)) {
+            if (!final_k_step) {
                 continue;
             }
-            std::string key = MakeKey(out_t, "out", row, col);
-            int64_t transfer_bytes = tile_w * tile_h;
-            int64_t resident = transfer_bytes;
-            if (!cache.count(key)) {
-                if (!ensure_capacity(resident, keep_this_tile)) return -1.0;
-                cache[key] = CacheEntry{{transfer_bytes, resident, false, ++access_clock}};
-                resident_bytes += resident;
-            } else {
-                cache[key].info.last_used = ++access_clock;
+            requirement.compute_cost += static_cast<double>(op.base_cost) * spatial_factor;
+            for (size_t tensor_id : op.inputs) {
+                int producer = graph.producer_of_tensor[tensor_id];
+                if (producer >= 0 && op_set.count(static_cast<size_t>(producer))) {
+                    continue;
+                }
+                if (retained_prev.count(tensor_id)) {
+                    continue;
+                }
+                requirement.slices[{tensor_id, 0, row_tile, col_tile, 0}] =
+                    actual_h * actual_w;
             }
-            memory_cost += static_cast<int64_t>(std::ceil(static_cast<double>(transfer_bytes) /
-                                                         problem.slow_memory_bandwidth));
-            keep_this_tile.insert(key);
-        }
-
-        // Compute cost for this tile.
-        double compute_cost = 0.0;
-        for (size_t op_id : topo) {
-            const auto& op = problem.ops[op_id];
-            const Tensor& out_tensor = problem.tensors[op.outputs.front()];
-            if (op.op_type == "MatMul") {
-                const auto& lhs = problem.tensors[op.inputs[0]];
-                const int64_t k_total = lhs.width;
-                compute_cost += static_cast<double>(op.base_cost) *
-                                static_cast<double>(k_total) /
-                                static_cast<double>(problem.native_granularity.depth);
-            } else {
-                (void)out_tensor;
-                compute_cost += static_cast<double>(op.base_cost);
+            size_t output_tensor = op.outputs.front();
+            if (boundary_outputs.count(output_tensor)) {
+                requirement.output_active_bytes += actual_h * actual_w;
+                if (retained_now.count(output_tensor)) {
+                    requirement.retained_outputs_completed.push_back(output_tensor);
+                } else {
+                    requirement.output_write_bytes += actual_h * actual_w;
+                }
             }
-        }
+        } else if (IsMatMul(op)) {
+            requirement.compute_cost += static_cast<double>(op.base_cost) * spatial_factor *
+                                        (static_cast<double>(k_step) /
+                                         static_cast<double>(native_k));
 
-        // Simple working-set validation for this tile.
-        int64_t working_set = 0;
-        for (size_t t : external_inputs) {
-            const auto& roles = input_roles[t];
-            const auto& tensor = problem.tensors[t];
-            const int64_t k_total = tensor.width;
-            if (roles.lhs) working_set += tile_h * std::min<int64_t>(sg.granularity.depth, k_total);
-            if (roles.rhs) working_set += std::min<int64_t>(sg.granularity.depth, k_total) * tile_w;
-            if (roles.pointwise) working_set += tile_w * tile_h;
-        }
-        working_set += tile_w * tile_h;
-        if (working_set > problem.fast_memory_capacity) {
-            std::cerr << "WARNING: subgraph tile working set exceeds fast memory capacity\n";
-            return -1.0;
-        }
+            for (size_t input_index = 0; input_index < op.inputs.size(); ++input_index) {
+                size_t tensor_id = op.inputs[input_index];
+                int producer = graph.producer_of_tensor[tensor_id];
+                if (producer >= 0 && op_set.count(static_cast<size_t>(producer))) {
+                    continue;
+                }
+                if (retained_prev.count(tensor_id)) {
+                    continue;
+                }
 
-        total += std::max(compute_cost, static_cast<double>(memory_cost));
-
-        // Evict non-retained output slices immediately after the tile.
-        std::vector<std::string> to_erase;
-        for (const auto& [key, entry] : cache) {
-            if (keep_this_tile.count(key)) continue;
-            // Keep boundary inputs resident for reuse; evict only if they are not required.
-            if (key.find(":out:") != std::string::npos) {
-                resident_bytes -= entry.info.resident_bytes;
-                to_erase.push_back(key);
+                if (input_index == 0) {
+                    requirement.slices[{tensor_id, 1, row_tile, 0, k_begin}] =
+                        actual_h * k_step;
+                } else {
+                    requirement.slices[{tensor_id, 2, 0, col_tile, k_begin}] =
+                        actual_w * k_step;
+                }
             }
+
+            size_t output_tensor = op.outputs.front();
+            if (boundary_outputs.count(output_tensor)) {
+                requirement.output_active_bytes += actual_h * actual_w;
+                if (final_k_step) {
+                    if (retained_now.count(output_tensor)) {
+                        requirement.retained_outputs_completed.push_back(output_tensor);
+                    } else {
+                        requirement.output_write_bytes += actual_h * actual_w;
+                    }
+                }
+            }
+        } else {
+            return {};
         }
-        for (const auto& key : to_erase) cache.erase(key);
     }
-    return total;
+
+    return requirement;
+}
+
+bool Contains(const std::unordered_set<size_t>& values, size_t value) {
+    return values.find(value) != values.end();
+}
+
+bool EvaluateSubgraphImpl(const Problem& problem, const OpGraph& graph,
+                          const Subgraph& sg,
+                          const std::vector<size_t>& retained_inputs_vec,
+                          SubgraphEvaluation* evaluation) {
+    if (evaluation == nullptr) {
+        return false;
+    }
+    *evaluation = {};
+
+    if (sg.op_ids.empty()) {
+        return false;
+    }
+    if (sg.granularity.width <= 0 || sg.granularity.height <= 0 ||
+        sg.granularity.depth <= 0) {
+        return false;
+    }
+
+    std::unordered_set<size_t> unique_ops;
+    for (size_t op_id : sg.op_ids) {
+        if (op_id >= problem.ops.size()) {
+            return false;
+        }
+        if (!unique_ops.insert(op_id).second) {
+            return false;
+        }
+    }
+
+    std::vector<size_t> ordered_ops = TopoSortSubset(graph, sg.op_ids);
+    if (!IsConnectedSubgraph(graph, ordered_ops)) {
+        return false;
+    }
+    if (!SharesCommonOutputShape(problem, ordered_ops)) {
+        return false;
+    }
+
+    BoundaryInfo boundary = ComputeBoundaryInfo(problem, graph, ordered_ops);
+    std::unordered_set<size_t> boundary_outputs_set(boundary.boundary_outputs.begin(),
+                                                    boundary.boundary_outputs.end());
+    std::unordered_set<size_t> retained_now;
+    for (size_t tensor_id : sg.tensors_to_retain) {
+        if (!boundary_outputs_set.count(tensor_id)) {
+            return false;
+        }
+        retained_now.insert(tensor_id);
+    }
+
+    std::unordered_set<size_t> retained_prev;
+    for (size_t tensor_id : retained_inputs_vec) {
+        retained_prev.insert(tensor_id);
+    }
+
+    const auto& ref_out =
+        problem.tensors[problem.ops[ordered_ops.front()].outputs.front()];
+    const int64_t tiles_w = CeilDiv(ref_out.width, sg.granularity.width);
+    const int64_t tiles_h = CeilDiv(ref_out.height, sg.granularity.height);
+    const size_t spatial_tiles = static_cast<size_t>(tiles_w * tiles_h);
+    if (!ValidateTraversalOrder(spatial_tiles, sg.traversal_order)) {
+        return false;
+    }
+    const auto traversal = BuildTraversal(spatial_tiles, sg.traversal_order);
+
+    std::unordered_set<size_t> retained_prev_used;
+    int64_t retained_prev_bytes = 0;
+    for (size_t tensor_id : boundary.boundary_inputs) {
+        if (Contains(retained_prev, tensor_id)) {
+            retained_prev_used.insert(tensor_id);
+            retained_prev_bytes += TensorBytes(problem.tensors[tensor_id]);
+        }
+    }
+
+    int64_t max_k_steps = 1;
+    for (size_t op_id : ordered_ops) {
+        if (IsMatMul(problem.ops[op_id])) {
+            max_k_steps = std::max(max_k_steps,
+                                   CeilDiv(MatMulK(problem, op_id),
+                                           sg.granularity.depth));
+        }
+    }
+
+    std::unordered_map<SliceKey, ResidentSlice, SliceKeyHash> resident;
+    std::unordered_map<size_t, int64_t> retained_output_bytes;
+    TotalLatency subgraph_latency = 0.0;
+    int64_t logical_time = 0;
+    int64_t peak_live_bytes = retained_prev_bytes;
+
+    auto resident_total = [&resident]() {
+        int64_t total = 0;
+        for (const auto& [_, slice] : resident) {
+            total += slice.bytes;
+        }
+        return total;
+    };
+
+    for (size_t traversal_idx : traversal) {
+        const int64_t row_tile = static_cast<int64_t>(traversal_idx / tiles_w);
+        const int64_t col_tile = static_cast<int64_t>(traversal_idx % tiles_w);
+        const int64_t actual_h =
+            std::min<int64_t>(sg.granularity.height,
+                              ref_out.height - row_tile * sg.granularity.height);
+        const int64_t actual_w =
+            std::min<int64_t>(sg.granularity.width,
+                              ref_out.width - col_tile * sg.granularity.width);
+
+        for (int64_t step_index = 0; step_index < max_k_steps; ++step_index) {
+            const int64_t k_begin = step_index * sg.granularity.depth;
+            int64_t actual_k_step = 0;
+            for (size_t op_id : ordered_ops) {
+                if (!IsMatMul(problem.ops[op_id])) {
+                    continue;
+                }
+                const int64_t op_k = MatMulK(problem, op_id);
+                if (k_begin < op_k) {
+                    actual_k_step = std::max<int64_t>(
+                        actual_k_step,
+                        std::min<int64_t>(sg.granularity.depth, op_k - k_begin));
+                }
+            }
+            if (actual_k_step == 0) {
+                actual_k_step = sg.granularity.depth;
+            }
+
+            StepRequirement requirement = BuildStepRequirement(
+                problem, graph, ordered_ops, boundary, sg.granularity,
+                retained_prev_used, retained_now, row_tile, col_tile, actual_h,
+                actual_w, k_begin, actual_k_step, step_index, max_k_steps);
+
+            std::unordered_set<SliceKey, SliceKeyHash> required_now;
+            int64_t new_bytes = 0;
+            for (const auto& [key, bytes] : requirement.slices) {
+                required_now.insert(key);
+                if (!resident.count(key)) {
+                    new_bytes += bytes;
+                }
+            }
+
+            int64_t retained_output_total = 0;
+            for (const auto& [_, bytes] : retained_output_bytes) {
+                retained_output_total += bytes;
+            }
+
+            if (!EnsureCapacity(problem.fast_memory_capacity,
+                                retained_prev_bytes + retained_output_total,
+                                requirement.output_active_bytes, required_now,
+                                &resident, new_bytes)) {
+                return false;
+            }
+
+            double memory_in = 0.0;
+            for (const auto& [key, bytes] : requirement.slices) {
+                auto it = resident.find(key);
+                if (it == resident.end()) {
+                    resident[key] = ResidentSlice{bytes, ++logical_time};
+                    memory_in += static_cast<double>(bytes);
+                } else {
+                    it->second.last_used = ++logical_time;
+                }
+            }
+
+            peak_live_bytes = std::max(
+                peak_live_bytes,
+                retained_prev_bytes + retained_output_total +
+                    requirement.output_active_bytes + resident_total());
+
+            if (retained_prev_bytes + retained_output_total +
+                    requirement.output_active_bytes >
+                problem.fast_memory_capacity) {
+                return false;
+            }
+
+            const double step_latency = std::max(
+                requirement.compute_cost,
+                (memory_in + static_cast<double>(requirement.output_write_bytes)) /
+                    static_cast<double>(problem.slow_memory_bandwidth));
+            subgraph_latency += step_latency;
+
+            for (size_t tensor_id : requirement.retained_outputs_completed) {
+                retained_output_bytes[tensor_id] += actual_h * actual_w;
+            }
+        }
+    }
+
+    for (size_t tensor_id : sg.tensors_to_retain) {
+        if (retained_output_bytes[tensor_id] != TensorBytes(problem.tensors[tensor_id])) {
+            return false;
+        }
+    }
+
+    evaluation->valid = true;
+    evaluation->latency = subgraph_latency;
+    evaluation->peak_live_bytes = peak_live_bytes;
+    return true;
+}
+
+bool RecomputeImpl(const Problem& problem, const Solution& input_solution,
+                   Solution* normalized_solution, TotalLatency* total_latency) {
+    if (input_solution.subgraphs.empty()) {
+        std::cerr << "ERROR: Solution contains no subgraphs\n";
+        return false;
+    }
+
+    const OpGraph graph = BuildOpGraph(problem);
+    std::set<size_t> covered_ops;
+    std::unordered_set<size_t> slow_available(problem.graph_inputs.begin(),
+                                              problem.graph_inputs.end());
+    std::unordered_set<size_t> retained_prev;
+    TotalLatency recomputed_total = 0.0;
+
+    if (normalized_solution != nullptr) {
+        *normalized_solution = input_solution;
+    }
+
+    for (size_t sg_idx = 0; sg_idx < input_solution.subgraphs.size(); ++sg_idx) {
+        const auto& sg = input_solution.subgraphs[sg_idx];
+        if (sg.op_ids.empty()) {
+            std::cerr << "ERROR: Subgraph " << sg_idx << " is empty\n";
+            return false;
+        }
+        if (sg.granularity.width <= 0 || sg.granularity.height <= 0 ||
+            sg.granularity.depth <= 0) {
+            std::cerr << "ERROR: Subgraph " << sg_idx
+                      << " has non-positive granularity\n";
+            return false;
+        }
+
+        std::unordered_set<size_t> unique_ops;
+        for (size_t op_id : sg.op_ids) {
+            if (op_id >= problem.ops.size()) {
+                std::cerr << "ERROR: Subgraph " << sg_idx << " references invalid op "
+                          << op_id << "\n";
+                return false;
+            }
+            if (!unique_ops.insert(op_id).second) {
+                std::cerr << "ERROR: Subgraph " << sg_idx
+                          << " repeats an op within the same group\n";
+                return false;
+            }
+            covered_ops.insert(op_id);
+        }
+
+        std::vector<size_t> ordered_ops = TopoSortSubset(graph, sg.op_ids);
+        if (!IsConnectedSubgraph(graph, ordered_ops)) {
+            std::cerr << "ERROR: Subgraph " << sg_idx
+                      << " is not a connected sub-DAG\n";
+            return false;
+        }
+        if (!SharesCommonOutputShape(problem, ordered_ops)) {
+            std::cerr << "ERROR: Subgraph " << sg_idx
+                      << " mixes incompatible output shapes\n";
+            return false;
+        }
+
+        BoundaryInfo boundary = ComputeBoundaryInfo(problem, graph, ordered_ops);
+        std::unordered_set<size_t> boundary_outputs_set(boundary.boundary_outputs.begin(),
+                                                        boundary.boundary_outputs.end());
+        std::unordered_set<size_t> retained_now;
+        for (size_t tensor_id : sg.tensors_to_retain) {
+            if (!boundary_outputs_set.count(tensor_id)) {
+                std::cerr << "ERROR: Subgraph " << sg_idx
+                          << " retains tensor " << tensor_id
+                          << " that is not one of its boundary outputs\n";
+                return false;
+            }
+            retained_now.insert(tensor_id);
+        }
+
+        for (size_t tensor_id : boundary.boundary_inputs) {
+            if (!Contains(retained_prev, tensor_id) &&
+                !Contains(slow_available, tensor_id)) {
+                std::cerr << "ERROR: Subgraph " << sg_idx
+                          << " needs tensor " << tensor_id
+                          << " that is unavailable in fast or slow memory\n";
+                return false;
+            }
+        }
+
+        std::vector<size_t> retained_inputs_for_sg;
+        for (size_t tensor_id : boundary.boundary_inputs) {
+            if (Contains(retained_prev, tensor_id)) {
+                retained_inputs_for_sg.push_back(tensor_id);
+            }
+        }
+
+        SubgraphEvaluation subgraph_eval;
+        if (!EvaluateSubgraphImpl(problem, graph, sg, retained_inputs_for_sg,
+                                  &subgraph_eval) ||
+            !subgraph_eval.valid) {
+            std::cerr << "ERROR: Subgraph " << sg_idx
+                      << " exceeds fast memory capacity\n";
+            return false;
+        }
+        const double subgraph_latency = subgraph_eval.latency;
+
+        if (std::fabs(subgraph_latency - sg.subgraph_latency) > 1e-3) {
+            std::cerr << "WARNING: Subgraph " << sg_idx
+                      << " reported latency " << sg.subgraph_latency
+                      << " but recomputed latency is " << subgraph_latency << "\n";
+        }
+        if (normalized_solution != nullptr) {
+            (*normalized_solution).subgraphs[sg_idx].subgraph_latency =
+                subgraph_latency;
+        }
+
+        for (size_t tensor_id : boundary.boundary_outputs) {
+            if (!retained_now.count(tensor_id)) {
+                slow_available.insert(tensor_id);
+            }
+        }
+        retained_prev = std::move(retained_now);
+        recomputed_total += subgraph_latency;
+    }
+
+    for (size_t op_id = 0; op_id < problem.ops.size(); ++op_id) {
+        if (!covered_ops.count(op_id)) {
+            std::cerr << "ERROR: Op " << op_id << " is not covered by any subgraph\n";
+            return false;
+        }
+    }
+
+    for (size_t tensor_id : problem.graph_outputs) {
+        if (!slow_available.count(tensor_id)) {
+            std::cerr << "ERROR: Graph output tensor " << tensor_id
+                      << " is not available in slow memory at program end\n";
+            return false;
+        }
+    }
+
+    if (total_latency != nullptr) {
+        *total_latency = recomputed_total;
+    }
+    return true;
 }
 
 }  // namespace
 
-std::vector<SubgraphLatency> ComputeSubgraphLatencies(const Problem& problem,
-                                                      const Solution& solution) {
-    std::vector<SubgraphLatency> latencies;
-    latencies.reserve(solution.subgraphs.size());
-
-    std::unordered_set<size_t> retained_from_prev;
-    for (const auto& sg : solution.subgraphs) {
-        std::unordered_set<size_t> retained_after;
-        double latency = EstimateSubgraphLatency(problem, solution, sg, retained_from_prev,
-                                                 retained_after);
-        latencies.push_back(latency);
-        retained_from_prev = std::move(retained_after);
+TotalLatency Evaluate(const Problem& problem, const Solution& solution) {
+    TotalLatency total_latency = -1.0;
+    if (!RecomputeImpl(problem, solution, nullptr, &total_latency)) {
+        return -1.0;
     }
-
-    return latencies;
+    return total_latency;
 }
 
-TotalLatency Evaluate(const Problem& problem, const Solution& solution) {
-    std::set<size_t> covered_ops;
-    for (const auto& sg : solution.subgraphs) {
-        for (size_t op_id : sg.op_ids) {
-            covered_ops.insert(op_id);
-        }
-    }
+bool EvaluateSubgraph(const Problem& problem, const Subgraph& subgraph,
+                      const std::vector<size_t>& retained_inputs,
+                      SubgraphEvaluation* evaluation) {
+    const OpGraph graph = BuildOpGraph(problem);
+    return EvaluateSubgraphImpl(problem, graph, subgraph, retained_inputs,
+                                evaluation);
+}
 
-    for (size_t i = 0; i < problem.ops.size(); ++i) {
-        if (!covered_ops.count(i)) {
-            std::cerr << "WARNING: Op " << i << " not covered by any subgraph\n";
-            return -1.0;
-        }
+bool RecomputeLatencies(const Problem& problem, Solution* solution,
+                        TotalLatency* total_latency) {
+    if (solution == nullptr) {
+        return false;
     }
-
-    auto latencies = ComputeSubgraphLatencies(problem, solution);
-    TotalLatency total = 0.0;
-    for (double latency : latencies) {
-        if (latency < 0.0) return -1.0;
-        total += latency;
+    Solution normalized;
+    if (!RecomputeImpl(problem, *solution, &normalized, total_latency)) {
+        return false;
     }
-    return total;
+    *solution = std::move(normalized);
+    return true;
 }
 
 }  // namespace mlsys
