@@ -23,9 +23,9 @@ int main(int argc, char* argv[]) {
         // Solve
         auto solution = mlsys::Solve(problem);
 
-        // Evaluate locally (optional sanity check)
-        auto latency = mlsys::Evaluate(problem, solution);
-        if (latency < 0) {
+        // Recompute subgraph latencies and validate locally before writing.
+        mlsys::TotalLatency latency = -1.0;
+        if (!mlsys::RecomputeLatencies(problem, &solution, &latency)) {
             std::cerr << "ERROR: Solution is invalid!\n";
         } else {
             std::cerr << "Total latency: " << latency << "\n";

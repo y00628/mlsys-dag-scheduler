@@ -1,17 +1,200 @@
 #include "solver.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <queue>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "optimus.h"
+
 namespace mlsys {
 
 namespace {
+
+enum class SolverBackend {
+    kBaseline = 0,
+    kOptimus,
+};
+
+struct BaselineCandidate {
+    Granularity granularity{};
+    double latency = std::numeric_limits<double>::infinity();
+    bool valid = false;
+};
+
+int64_t CeilDivInt(int64_t value, int64_t divisor) {
+    if (divisor <= 0) {
+        return 0;
+    }
+    return (value + divisor - 1) / divisor;
+}
+
+bool IsMatMul(const Op& op) {
+    return op.op_type == "MatMul";
+}
+
+int64_t MatMulK(const Problem& problem, size_t op_id) {
+    const auto& op = problem.ops[op_id];
+    if (op.inputs.size() < 2) {
+        return 1;
+    }
+    return std::max<int64_t>(1, problem.tensors[op.inputs[0]].width);
+}
+
+std::vector<int64_t> BuildSpatialCandidates(int64_t dim, int64_t native_dim) {
+    std::set<int64_t> values;
+    values.insert(std::max<int64_t>(1, dim));
+    values.insert(std::max<int64_t>(1, std::min(dim, native_dim)));
+    values.insert(std::max<int64_t>(1, std::min(dim, native_dim / 2)));
+    values.insert(std::max<int64_t>(1, std::min(dim, native_dim / 4)));
+
+    std::vector<int64_t> result(values.begin(), values.end());
+    std::sort(result.begin(), result.end(), std::greater<int64_t>());
+    return result;
+}
+
+std::vector<int64_t> BuildKCandidates(const Problem& problem, size_t op_id) {
+    if (!IsMatMul(problem.ops[op_id])) {
+        return {1};
+    }
+
+    const int64_t max_k = MatMulK(problem, op_id);
+    const int64_t native_k = std::max<int64_t>(1, problem.native_granularity.depth);
+    std::set<int64_t> values;
+    values.insert(max_k);
+    values.insert(std::max<int64_t>(1, std::min(max_k, native_k)));
+    values.insert(std::max<int64_t>(1, std::min(max_k, native_k / 2)));
+    values.insert(std::max<int64_t>(1, std::min(max_k, native_k / 4)));
+
+    std::vector<int64_t> result(values.begin(), values.end());
+    std::sort(result.begin(), result.end(), std::greater<int64_t>());
+    return result;
+}
+
+double EstimateSingleOpLatency(const Problem& problem, size_t op_idx,
+                               const Granularity& granularity,
+                               bool* valid_out) {
+    const auto& op = problem.ops[op_idx];
+    const auto& out = problem.tensors[op.outputs.front()];
+    const int64_t native_w = std::max<int64_t>(1, problem.native_granularity.width);
+    const int64_t native_h = std::max<int64_t>(1, problem.native_granularity.height);
+    const int64_t native_k = std::max<int64_t>(1, problem.native_granularity.depth);
+
+    const int64_t tiles_w = CeilDivInt(out.width, granularity.width);
+    const int64_t tiles_h = CeilDivInt(out.height, granularity.height);
+    const double spatial_factor =
+        static_cast<double>(CeilDivInt(granularity.width, native_w) *
+                            CeilDivInt(granularity.height, native_h));
+
+    double total_latency = 0.0;
+    bool valid = true;
+
+    for (int64_t row_tile = 0; row_tile < tiles_h; ++row_tile) {
+        for (int64_t col_tile = 0; col_tile < tiles_w; ++col_tile) {
+            const int64_t actual_h =
+                std::min<int64_t>(granularity.height,
+                                  out.height - row_tile * granularity.height);
+            const int64_t actual_w =
+                std::min<int64_t>(granularity.width,
+                                  out.width - col_tile * granularity.width);
+
+            if (IsMatMul(op)) {
+                const int64_t k_total = MatMulK(problem, op_idx);
+                const int64_t k_steps = CeilDivInt(k_total, granularity.depth);
+                for (int64_t step = 0; step < k_steps; ++step) {
+                    const int64_t k_begin = step * granularity.depth;
+                    const int64_t k_step =
+                        std::min<int64_t>(granularity.depth, k_total - k_begin);
+                    const int64_t working_set =
+                        actual_h * k_step + actual_w * k_step + actual_h * actual_w;
+                    if (working_set > problem.fast_memory_capacity) {
+                        valid = false;
+                        break;
+                    }
+
+                    const double compute =
+                        static_cast<double>(op.base_cost) * spatial_factor *
+                        (static_cast<double>(k_step) / static_cast<double>(native_k));
+                    const double memory_in =
+                        static_cast<double>(actual_h * k_step + actual_w * k_step);
+                    const double memory_out =
+                        (step == k_steps - 1) ? static_cast<double>(actual_h * actual_w)
+                                              : 0.0;
+                    total_latency += std::max(
+                        compute, (memory_in + memory_out) /
+                                     static_cast<double>(problem.slow_memory_bandwidth));
+                }
+                if (!valid) {
+                    break;
+                }
+            } else {
+                const int64_t working_set =
+                    static_cast<int64_t>(op.inputs.size() + 1) * actual_h * actual_w;
+                if (working_set > problem.fast_memory_capacity) {
+                    valid = false;
+                    break;
+                }
+
+                const double compute =
+                    static_cast<double>(op.base_cost) * spatial_factor;
+                const double memory_in =
+                    static_cast<double>(op.inputs.size()) *
+                    static_cast<double>(actual_h * actual_w);
+                const double memory_out = static_cast<double>(actual_h * actual_w);
+                total_latency += std::max(
+                    compute, (memory_in + memory_out) /
+                                 static_cast<double>(problem.slow_memory_bandwidth));
+            }
+        }
+        if (!valid) {
+            break;
+        }
+    }
+
+    if (valid_out != nullptr) {
+        *valid_out = valid;
+    }
+    return valid ? total_latency : std::numeric_limits<double>::infinity();
+}
+
+BaselineCandidate ChooseSingleOpGranularity(const Problem& problem, size_t op_idx) {
+    BaselineCandidate best;
+    const auto& out = problem.tensors[problem.ops[op_idx].outputs.front()];
+    const auto widths =
+        BuildSpatialCandidates(out.width, problem.native_granularity.width);
+    const auto heights =
+        BuildSpatialCandidates(out.height, problem.native_granularity.height);
+    const auto depths = BuildKCandidates(problem, op_idx);
+
+    for (int64_t width : widths) {
+        for (int64_t height : heights) {
+            for (int64_t depth : depths) {
+                Granularity granularity{width, height, depth};
+                bool valid = false;
+                const double latency =
+                    EstimateSingleOpLatency(problem, op_idx, granularity, &valid);
+                if (!valid) {
+                    continue;
+                }
+                if (!best.valid || latency < best.latency) {
+                    best.valid = true;
+                    best.granularity = granularity;
+                    best.latency = latency;
+                }
+            }
+        }
+    }
+
+    return best;
+}
 
 // -----------------------------------------------------------------
 // Utility: topological sort of the ops DAG
@@ -67,35 +250,44 @@ Solution NaiveBaseline(const Problem& problem) {
     auto order = TopologicalSort(problem);
 
     for (auto op_idx : order) {
-        const auto& op = problem.ops[op_idx];
         Subgraph sg;
         sg.op_ids = {op_idx};
-        sg.granularity = problem.native_granularity;
-
-        // For MatMul, set depth = native width (full reduction in one step for now).
-        // TODO: compute proper depth from the inner dimension of the matmul.
-        if (op.op_type == "MatMul" && op.inputs.size() == 2) {
-            // Inner dimension K = width of right input (or height of left input).
-            // For a standard MatMul: Left[M x K] * Right[K x N] = Out[M x N]
-            // K = width of the left input = height of the right input
-            // We'll use the width of the right input tensor as K for now.
-            auto k_dim = problem.tensors[op.inputs[1]].height;
-            sg.granularity.depth = k_dim;  // full reduction, no split-k
+        const BaselineCandidate candidate =
+            ChooseSingleOpGranularity(problem, op_idx);
+        if (candidate.valid) {
+            sg.granularity = candidate.granularity;
+            sg.subgraph_latency = candidate.latency;
         } else {
-            sg.granularity.depth = 1;  // Pointwise: k is irrelevant
+            sg.granularity = problem.native_granularity;
+            sg.granularity.depth = IsMatMul(problem.ops[op_idx])
+                                       ? std::max<int64_t>(1, MatMulK(problem, op_idx))
+                                       : 1;
+            sg.subgraph_latency = std::numeric_limits<double>::infinity();
         }
 
         // Don't retain anything — every tensor goes back to slow memory
         sg.tensors_to_retain = {};
 
-        // Basic placeholder latency: use base_cost so output remains sane.
-        // TODO: replace with scorer-aligned latency computation.
-        sg.subgraph_latency = static_cast<double>(op.base_cost);
-
         sol.subgraphs.push_back(std::move(sg));
     }
 
     return sol;
+}
+
+SolverBackend ParseSolverBackend() {
+    const char* raw = std::getenv("MLSYS_SOLVER");
+    if (raw == nullptr) {
+        return SolverBackend::kOptimus;
+    }
+
+    std::string backend(raw);
+    std::transform(backend.begin(), backend.end(), backend.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (backend == "baseline" || backend == "naive") {
+        return SolverBackend::kBaseline;
+    }
+    return SolverBackend::kOptimus;
 }
 
 }  // namespace
@@ -109,18 +301,18 @@ Solution Solve(const Problem& problem) {
               << "fast_mem=" << problem.fast_memory_capacity
               << ", slow_bw=" << problem.slow_memory_bandwidth << "\n";
 
-    // Start with naive baseline
-    Solution best = NaiveBaseline(problem);
-
-    // TODO: Implement better strategies:
-    //   1. Operator fusion — group connected ops into subgraphs to make
-    //      intermediate tensors ephemeral (zero memory cost).
-    //   2. Granularity tuning — find the best [w, h, k] per subgraph
-    //      that fits the working set in fast memory.
-    //   3. Tensor retention — keep frequently reused tensors in fast memory
-    //      across subgraph boundaries.
-    //   4. Traversal order optimization — snake patterns etc. for data reuse.
-    //   5. Search / optimization — simulated annealing, beam search, ILP, etc.
+    Solution best;
+    switch (ParseSolverBackend()) {
+        case SolverBackend::kBaseline:
+            std::cerr << "Solver backend: baseline\n";
+            best = NaiveBaseline(problem);
+            break;
+        case SolverBackend::kOptimus:
+        default:
+            std::cerr << "Solver backend: optimus\n";
+            best = SolveWithOptimus(problem);
+            break;
+    }
 
     std::cerr << "Solution: " << best.subgraphs.size() << " subgraphs\n";
     return best;

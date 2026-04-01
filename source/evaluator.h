@@ -9,4 +9,9 @@ namespace mlsys {
 // Returns negative value on error (invalid solution).
 TotalLatency Evaluate(const Problem& problem, const Solution& solution);
 
+// Recomputes subgraph latencies in-place using the evaluator logic.
+// Returns false if the solution is invalid.
+bool RecomputeLatencies(const Problem& problem, Solution* solution,
+                        TotalLatency* total_latency);
+
 }  // namespace mlsys

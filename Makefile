@@ -10,7 +10,8 @@ ifeq ($(UNAME_S),Darwin)
 STATIC_LDFLAGS :=
 endif
 SOURCES  := $(SRCDIR)/main.cpp $(SRCDIR)/problem.cpp $(SRCDIR)/solution.cpp \
-            $(SRCDIR)/evaluator.cpp $(SRCDIR)/solver.cpp
+            $(SRCDIR)/evaluator.cpp $(SRCDIR)/solver.cpp \
+            $(SRCDIR)/conv_accelerator.cpp $(SRCDIR)/optimus.cpp
 
 # Default: debug build
 .PHONY: all clean release submission
