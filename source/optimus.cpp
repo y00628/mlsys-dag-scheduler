@@ -1,12 +1,19 @@
 #include "optimus.h"
 
+#include "conv_accelerator.h"
+#include "evaluator.h"
+
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <queue>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -53,14 +60,107 @@ struct CandidateGroup {
     int64_t internalized_bytes = 0;
 };
 
-struct DpState {
+enum class CandidateGenerationMode {
+    kInterval = 0,
+    kSeedGrowth,
+};
+
+enum class GuidanceMode {
+    kContest = 0,
+    kConvAccelerator,
+};
+
+enum class ConvGuidanceVariant {
+    kAdditivePenaltyV1 = 0,
+    kLocalRerankV2,
+};
+
+struct OptimusConfig {
+    CandidateGenerationMode candidate_mode = CandidateGenerationMode::kInterval;
+    GuidanceMode guidance_mode = GuidanceMode::kContest;
+    ConvGuidanceVariant conv_guidance_variant =
+        ConvGuidanceVariant::kAdditivePenaltyV1;
+};
+
+struct ConvGuidanceMetrics {
+    bool valid = false;
+    double ranking_penalty = 0.0;
+    int64_t working_set_bytes = 0;
+    int64_t parameter_refills = 0;
+    int64_t subgroup_count = 0;
+    double memory_traffic_bytes = 0.0;
+};
+
+struct SearchDecision {
+    bool valid = false;
     double cost = std::numeric_limits<double>::infinity();
-    size_t next_index = 0;
     size_t candidate_index = 0;
+    std::vector<size_t> retained_outputs;
+};
+
+struct SearchStateKey {
+    size_t start = 0;
+    std::vector<size_t> retained_inputs;
+
+    bool operator==(const SearchStateKey& other) const {
+        return start == other.start && retained_inputs == other.retained_inputs;
+    }
+};
+
+struct SearchStateKeyHash {
+    size_t operator()(const SearchStateKey& key) const {
+        size_t h = std::hash<size_t>{}(key.start);
+        for (size_t tensor_id : key.retained_inputs) {
+            h ^= std::hash<size_t>{}(tensor_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+};
+
+struct ScoreCacheKey {
+    std::vector<size_t> ops;
+    Granularity granularity{};
+    std::vector<size_t> retained_inputs;
+    std::vector<size_t> retained_outputs;
+
+    bool operator==(const ScoreCacheKey& other) const {
+        return ops == other.ops &&
+               granularity.width == other.granularity.width &&
+               granularity.height == other.granularity.height &&
+               granularity.depth == other.granularity.depth &&
+               retained_inputs == other.retained_inputs &&
+               retained_outputs == other.retained_outputs;
+    }
+};
+
+struct ScoreCacheKeyHash {
+    size_t operator()(const ScoreCacheKey& key) const {
+        size_t h = 0;
+        auto mix = [&](size_t value) {
+            h ^= value + 0x9e3779b9 + (h << 6) + (h >> 2);
+        };
+        for (size_t op_id : key.ops) {
+            mix(std::hash<size_t>{}(op_id));
+        }
+        mix(std::hash<int64_t>{}(key.granularity.width));
+        mix(std::hash<int64_t>{}(key.granularity.height));
+        mix(std::hash<int64_t>{}(key.granularity.depth));
+        for (size_t tensor_id : key.retained_inputs) {
+            mix(std::hash<size_t>{}(tensor_id));
+        }
+        for (size_t tensor_id : key.retained_outputs) {
+            mix(std::hash<size_t>{}(tensor_id));
+        }
+        return h;
+    }
 };
 
 constexpr double kInfinity = std::numeric_limits<double>::infinity();
-constexpr size_t kDefaultMaxGroupSize = 4;
+constexpr size_t kDefaultMaxGroupSize = 8;
+constexpr size_t kGranularityRefineBudget = 6;
+constexpr size_t kConvRerankBudget = 8;
+
+std::unordered_map<ScoreCacheKey, GroupMetrics, ScoreCacheKeyHash> g_score_cache;
 
 int64_t CeilDivInt(int64_t value, int64_t divisor) {
     if (divisor <= 0) {
@@ -71,6 +171,15 @@ int64_t CeilDivInt(int64_t value, int64_t divisor) {
 
 int64_t TensorElements(const Tensor& tensor) {
     return tensor.width * tensor.height;
+}
+
+int64_t TensorBytesForSet(const Problem& problem,
+                         const std::vector<size_t>& tensors) {
+    int64_t total = 0;
+    for (size_t tensor_id : tensors) {
+        total += TensorElements(problem.tensors[tensor_id]);
+    }
+    return total;
 }
 
 int64_t MatMulK(const Problem& problem, size_t op_id) {
@@ -87,6 +196,62 @@ bool IsMatMul(const Op& op) {
 
 bool IsPointwise(const Op& op) {
     return op.op_type == "Pointwise";
+}
+
+bool ContainsMatMul(const Problem& problem, const std::vector<size_t>& ops) {
+    for (size_t op_id : ops) {
+        if (IsMatMul(problem.ops[op_id])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+CandidateGenerationMode GetCandidateGenerationMode() {
+    const char* raw = std::getenv("MLSYS_OPTIMUS_CANDIDATES");
+    if (raw == nullptr) {
+        return CandidateGenerationMode::kInterval;
+    }
+
+    std::string mode(raw);
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (mode == "interval") {
+        return CandidateGenerationMode::kInterval;
+    }
+    if (mode == "seed" || mode == "seed-growth" || mode == "seed_growth") {
+        return CandidateGenerationMode::kSeedGrowth;
+    }
+    return CandidateGenerationMode::kInterval;
+}
+
+bool SeedDebugEnabled() {
+    const char* raw = std::getenv("MLSYS_OPTIMUS_DEBUG_SEED");
+    return raw != nullptr && std::string(raw) == "1";
+}
+
+ConvDataflow ParseConvDataflow() {
+    const char* raw = std::getenv("MLSYS_OPTIMUS_CONV_DATAFLOW");
+    if (raw == nullptr) {
+        return ConvDataflow::kRowStationary;
+    }
+
+    std::string mode(raw);
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (mode == "os" || mode == "output" || mode == "output_stationary") {
+        return ConvDataflow::kOutputStationary;
+    }
+    if (mode == "ws" || mode == "weight" || mode == "weight_stationary") {
+        return ConvDataflow::kWeightStationary;
+    }
+    if (mode == "is" || mode == "input" || mode == "input_stationary") {
+        return ConvDataflow::kInputStationary;
+    }
+    if (mode == "rs" || mode == "row" || mode == "row_stationary") {
+        return ConvDataflow::kRowStationary;
+    }
+    return ConvDataflow::kRowStationary;
 }
 
 OpGraph BuildOpGraph(const Problem& problem) {
@@ -195,6 +360,29 @@ bool IsConnectedSubDAG(const OpGraph& graph, const std::vector<size_t>& ops) {
     return visited.size() == ops.size();
 }
 
+bool IsLinearChainCandidate(const OpGraph& graph, const std::vector<size_t>& ops) {
+    if (ops.empty()) {
+        return false;
+    }
+    if (ops.size() == 1) {
+        return true;
+    }
+
+    for (size_t i = 1; i < ops.size(); ++i) {
+        bool linked = false;
+        for (size_t pred : graph.preds[ops[i]]) {
+            if (pred == ops[i - 1]) {
+                linked = true;
+                break;
+            }
+        }
+        if (!linked) {
+            return false;
+        }
+    }
+    return true;
+}
+
 GroupBoundary ComputeBoundary(const Problem& problem, const OpGraph& graph,
                               const std::vector<size_t>& ops) {
     GroupBoundary boundary;
@@ -237,12 +425,209 @@ GroupBoundary ComputeBoundary(const Problem& problem, const OpGraph& graph,
     return boundary;
 }
 
+ConvAcceleratorSpec BuildConvAcceleratorSpec(const Problem& problem) {
+    ConvAcceleratorSpec spec;
+    spec.on_chip_buffer_bytes = problem.fast_memory_capacity;
+    spec.line_buffer_bytes = std::max<int64_t>(0, problem.fast_memory_capacity / 8);
+    spec.pe_array_rows =
+        std::max<int64_t>(1, std::min<int64_t>(problem.native_granularity.height, 64));
+    spec.pe_array_cols =
+        std::max<int64_t>(1, std::min<int64_t>(problem.native_granularity.width, 64));
+    spec.rf_bytes_per_pe = 0;
+    spec.pe_throughput = std::max<int64_t>(1, problem.native_granularity.depth);
+    spec.dataflow = ParseConvDataflow();
+    spec.supports_line_buffer = true;
+    spec.supports_isoa = true;
+    return spec;
+}
+
+Conv2DOp BuildPseudoConvOp(const Problem& problem, size_t op_id) {
+    Conv2DOp conv;
+    conv.name = problem.ops[op_id].op_type + "_" + std::to_string(op_id);
+    conv.bytes_per_element = 1;
+
+    const auto& op = problem.ops[op_id];
+    const auto& out = problem.tensors[op.outputs.front()];
+    conv.output_height = std::max<int64_t>(1, out.height);
+    conv.output_width = 1;
+    conv.output_channels = std::max<int64_t>(1, out.width);
+    conv.kernel_height = 1;
+    conv.kernel_width = 1;
+    conv.stride_height = 1;
+    conv.stride_width = 1;
+
+    if (IsMatMul(op) && op.inputs.size() >= 2) {
+        const auto& lhs = problem.tensors[op.inputs[0]];
+        conv.input_height = std::max<int64_t>(1, lhs.height);
+        conv.input_width = 1;
+        conv.input_channels = std::max<int64_t>(1, lhs.width);
+        return conv;
+    }
+
+    int64_t input_height = conv.output_height;
+    int64_t input_channels = 0;
+    for (size_t tensor_id : op.inputs) {
+        const auto& tensor = problem.tensors[tensor_id];
+        input_height = std::max<int64_t>(input_height, tensor.height);
+        input_channels += std::max<int64_t>(1, tensor.width);
+    }
+    conv.input_height = std::max<int64_t>(1, input_height);
+    conv.input_width = 1;
+    conv.input_channels = std::max<int64_t>(1, input_channels);
+    return conv;
+}
+
+ConvTileShape BuildPseudoConvTerminalTile(const Problem& problem,
+                                          const std::vector<size_t>& ops,
+                                          const Granularity& granularity) {
+    ConvTileShape tile;
+    if (ops.empty()) {
+        return tile;
+    }
+    const auto& out = problem.tensors[problem.ops[ops.back()].outputs.front()];
+    tile.output_height =
+        std::max<int64_t>(1, std::min<int64_t>(granularity.height, out.height));
+    tile.output_width = 1;
+    tile.output_channels =
+        std::max<int64_t>(1, std::min<int64_t>(granularity.width, out.width));
+    return tile;
+}
+
+ConvGuidanceMetrics AnalyzeConvGuidance(const Problem& problem, const OpGraph& graph,
+                                        const std::vector<size_t>& ops,
+                                        const Granularity& granularity) {
+    ConvGuidanceMetrics metrics;
+    if (!IsLinearChainCandidate(graph, ops)) {
+        return metrics;
+    }
+
+    std::vector<Conv2DOp> conv_ops;
+    conv_ops.reserve(ops.size());
+    for (size_t op_id : ops) {
+        conv_ops.push_back(BuildPseudoConvOp(problem, op_id));
+    }
+
+    const ConvAcceleratorSpec spec = BuildConvAcceleratorSpec(problem);
+    const ConvTileShape terminal_tile =
+        BuildPseudoConvTerminalTile(problem, ops, granularity);
+    const ConvGroupScheduleEstimate estimate =
+        AnalyzeConvChain(conv_ops, spec, terminal_tile);
+    if (!estimate.valid) {
+        return metrics;
+    }
+
+    metrics.valid = true;
+    metrics.working_set_bytes = estimate.working_set.total_bytes;
+    metrics.parameter_refills = estimate.parameter_refills;
+    metrics.subgroup_count = estimate.subgroup_count;
+    metrics.memory_traffic_bytes = estimate.estimated_memory_traffic_bytes;
+    metrics.ranking_penalty =
+        estimate.estimated_memory_traffic_bytes /
+            std::max<double>(1.0, static_cast<double>(problem.slow_memory_bandwidth)) +
+        static_cast<double>(estimate.parameter_refills) * 0.25 +
+        static_cast<double>(std::max<int64_t>(0, estimate.subgroup_count - 1)) * 8.0;
+    return metrics;
+}
+
+bool ShouldApplyConvGuidanceV2(const Problem& problem, const OpGraph& graph,
+                               const std::vector<size_t>& ops) {
+    return ops.size() >= 2 && ContainsMatMul(problem, ops) &&
+           IsLinearChainCandidate(graph, ops);
+}
+
+void ApplyConvLocalRerankV2(
+    const Problem& problem, const OpGraph& graph,
+    const std::vector<size_t>& ops,
+    std::vector<std::pair<double, Granularity>>* proxy_ranked) {
+    if (proxy_ranked == nullptr || proxy_ranked->empty()) {
+        return;
+    }
+    if (!ShouldApplyConvGuidanceV2(problem, graph, ops)) {
+        return;
+    }
+
+    const size_t rerank_budget = std::min(kConvRerankBudget, proxy_ranked->size());
+    std::vector<std::pair<double, Granularity>> top_candidates(
+        proxy_ranked->begin(), proxy_ranked->begin() + rerank_budget);
+
+    struct RerankedCandidate {
+        double score = kInfinity;
+        double proxy_score = kInfinity;
+        Granularity granularity{};
+        bool pruned = false;
+    };
+
+    std::vector<RerankedCandidate> reranked;
+    reranked.reserve(top_candidates.size());
+    for (const auto& entry : top_candidates) {
+        RerankedCandidate ranked;
+        ranked.proxy_score = entry.first;
+        ranked.granularity = entry.second;
+
+        const ConvGuidanceMetrics conv_metrics =
+            AnalyzeConvGuidance(problem, graph, ops, entry.second);
+        if (!conv_metrics.valid) {
+            ranked.score = ranked.proxy_score;
+            reranked.push_back(ranked);
+            continue;
+        }
+        if (conv_metrics.working_set_bytes > problem.fast_memory_capacity ||
+            conv_metrics.parameter_refills >
+                static_cast<int64_t>(2 * std::max<size_t>(1, ops.size())) ||
+            conv_metrics.subgroup_count > 4) {
+            ranked.pruned = true;
+            reranked.push_back(ranked);
+            continue;
+        }
+
+        const double conv_traffic_time =
+            conv_metrics.memory_traffic_bytes /
+            std::max<double>(1.0, static_cast<double>(problem.slow_memory_bandwidth));
+        const double traffic_ratio =
+            conv_traffic_time / std::max<double>(1.0, ranked.proxy_score);
+        const double normalized_penalty = 0.15 * traffic_ratio;
+        ranked.score = ranked.proxy_score * (1.0 + normalized_penalty);
+        reranked.push_back(ranked);
+    }
+
+    std::stable_sort(reranked.begin(), reranked.end(),
+                     [](const RerankedCandidate& lhs,
+                        const RerankedCandidate& rhs) {
+                         if (lhs.pruned != rhs.pruned) {
+                             return !lhs.pruned;
+                         }
+                         if (lhs.score != rhs.score) {
+                             return lhs.score < rhs.score;
+                         }
+                         return lhs.proxy_score < rhs.proxy_score;
+                     });
+
+    size_t out_index = 0;
+    for (const auto& ranked : reranked) {
+        if (!ranked.pruned) {
+            (*proxy_ranked)[out_index++] = {ranked.proxy_score, ranked.granularity};
+        }
+    }
+    for (const auto& ranked : reranked) {
+        if (ranked.pruned) {
+            (*proxy_ranked)[out_index++] = {ranked.proxy_score, ranked.granularity};
+        }
+    }
+}
+
 std::vector<int64_t> BuildSpatialCandidates(int64_t dim, int64_t native_dim) {
     std::set<int64_t> values;
-    values.insert(std::max<int64_t>(1, dim));
-    values.insert(std::max<int64_t>(1, std::min(dim, native_dim)));
-    values.insert(std::max<int64_t>(1, std::min(dim, native_dim / 2)));
-    values.insert(std::max<int64_t>(1, std::min(dim, native_dim / 4)));
+    const int64_t safe_dim = std::max<int64_t>(1, dim);
+    const int64_t safe_native = std::max<int64_t>(1, native_dim);
+
+    values.insert(safe_dim);
+
+    for (int64_t divisor : {1LL, 2LL, 4LL, 8LL, 16LL}) {
+        values.insert(std::max<int64_t>(1, std::min(safe_dim, safe_native / divisor)));
+    }
+    for (int64_t tiles : {1LL, 2LL, 4LL, 8LL, 16LL, 32LL}) {
+        values.insert(std::max<int64_t>(1, CeilDivInt(safe_dim, tiles)));
+    }
 
     std::vector<int64_t> result(values.begin(), values.end());
     std::sort(result.begin(), result.end(), std::greater<int64_t>());
@@ -266,9 +651,12 @@ std::vector<int64_t> BuildKCandidates(const Problem& problem,
     std::set<int64_t> values;
     const int64_t native_k = std::max<int64_t>(1, problem.native_granularity.depth);
     values.insert(max_k);
-    values.insert(std::max<int64_t>(1, std::min(max_k, native_k)));
-    values.insert(std::max<int64_t>(1, std::min(max_k, native_k / 2)));
-    values.insert(std::max<int64_t>(1, std::min(max_k, native_k / 4)));
+    for (int64_t divisor : {1LL, 2LL, 4LL, 8LL, 16LL}) {
+        values.insert(std::max<int64_t>(1, std::min(max_k, native_k / divisor)));
+    }
+    for (int64_t steps : {1LL, 2LL, 4LL, 8LL, 16LL}) {
+        values.insert(std::max<int64_t>(1, CeilDivInt(max_k, steps)));
+    }
 
     std::vector<int64_t> result(values.begin(), values.end());
     std::sort(result.begin(), result.end(), std::greater<int64_t>());
@@ -279,6 +667,18 @@ int64_t EstimateWorkingSetBytes(const Problem& problem, const OpGraph& graph,
                                 const std::vector<size_t>& ops,
                                 const GroupBoundary& boundary,
                                 const Granularity& granularity);
+
+double EstimateProxyLatency(const Problem& problem, const OpGraph& graph,
+                            const std::vector<size_t>& ops,
+                            const GroupBoundary& boundary,
+                            const Granularity& granularity);
+
+void AddAnalyticalTileCandidates(const Problem& problem,
+                                  const OpGraph& graph,
+                                  const std::vector<size_t>& ops,
+                                  const GroupBoundary& boundary,
+                                  const std::vector<int64_t>& k_steps,
+                                  std::vector<std::pair<double, Granularity>>* proxy_ranked);
 
 StepEstimate EstimateStep(const Problem& problem, const OpGraph& graph,
                           const std::vector<size_t>& ops,
@@ -367,6 +767,41 @@ int64_t EstimateWorkingSetBytes(const Problem& problem, const OpGraph& graph,
 
     const auto& ref_out =
         problem.tensors[problem.ops[ops.front()].outputs.front()];
+
+    int64_t max_k_steps = 1;
+    for (size_t op_id : ops) {
+        if (IsMatMul(problem.ops[op_id])) {
+            max_k_steps = std::max(max_k_steps,
+                                   CeilDivInt(MatMulK(problem, op_id),
+                                              granularity.depth));
+        }
+    }
+
+    // Peak active bytes is maximized at the interior tile (largest actual_h/actual_w).
+    // Edge tiles have smaller dimensions and thus smaller working sets. O(k_steps) only.
+    const int64_t actual_h = std::min<int64_t>(granularity.height, ref_out.height);
+    const int64_t actual_w = std::min<int64_t>(granularity.width, ref_out.width);
+    int64_t peak = 0;
+    for (int64_t step_index = 0; step_index < max_k_steps; ++step_index) {
+        peak = std::max(peak, EstimateStep(problem, graph, ops, boundary,
+                                           granularity, actual_h, actual_w,
+                                           step_index, max_k_steps)
+                                  .active_bytes);
+    }
+
+    return peak;
+}
+
+double EstimateProxyLatency(const Problem& problem, const OpGraph& graph,
+                            const std::vector<size_t>& ops,
+                            const GroupBoundary& boundary,
+                            const Granularity& granularity) {
+    if (ops.empty()) {
+        return kInfinity;
+    }
+
+    const auto& ref_out =
+        problem.tensors[problem.ops[ops.front()].outputs.front()];
     const int64_t tiles_w = CeilDivInt(ref_out.width, granularity.width);
     const int64_t tiles_h = CeilDivInt(ref_out.height, granularity.height);
 
@@ -379,144 +814,71 @@ int64_t EstimateWorkingSetBytes(const Problem& problem, const OpGraph& graph,
         }
     }
 
-    int64_t peak = 0;
-    for (int64_t row_tile = 0; row_tile < tiles_h; ++row_tile) {
-        for (int64_t col_tile = 0; col_tile < tiles_w; ++col_tile) {
-            const int64_t actual_h =
-                std::min<int64_t>(granularity.height,
-                                  ref_out.height - row_tile * granularity.height);
-            const int64_t actual_w =
-                std::min<int64_t>(granularity.width,
-                                  ref_out.width - col_tile * granularity.width);
-            for (int64_t step_index = 0; step_index < max_k_steps; ++step_index) {
-                peak = std::max(peak, EstimateStep(problem, graph, ops, boundary,
-                                                   granularity, actual_h, actual_w,
-                                                   step_index, max_k_steps)
-                                          .active_bytes);
-            }
-        }
+    // Proxy: compute interior tile latency and multiply by tile count.
+    // Interior tile has actual_h = granularity.height, actual_w = granularity.width.
+    // This is O(k_steps) instead of O(tiles_h * tiles_w * k_steps).
+    const int64_t actual_h = std::min<int64_t>(granularity.height, ref_out.height);
+    const int64_t actual_w = std::min<int64_t>(granularity.width, ref_out.width);
+    double tile_latency = 0.0;
+    for (int64_t step_index = 0; step_index < max_k_steps; ++step_index) {
+        const StepEstimate estimate = EstimateStep(
+            problem, graph, ops, boundary, granularity, actual_h,
+            actual_w, step_index, max_k_steps);
+        const double proxy_memory =
+            (static_cast<double>(estimate.active_bytes) +
+             static_cast<double>(estimate.output_write_bytes)) /
+            static_cast<double>(problem.slow_memory_bandwidth);
+        tile_latency += std::max(estimate.compute_cost, proxy_memory);
     }
 
-    return peak;
+    return tile_latency * static_cast<double>(tiles_h * tiles_w);
 }
 
-double EstimateLatency(const Problem& problem, const OpGraph& graph,
-                       const std::vector<size_t>& ops,
-                       const GroupBoundary& boundary,
-                       const Granularity& granularity,
-                       const std::unordered_set<size_t>& retained_inputs = {},
-                       const std::unordered_set<size_t>& retained_outputs = {}) {
-    if (ops.empty()) {
-        return kInfinity;
+bool EvaluateWithOfficialScorer(const Problem& problem,
+                                const std::vector<size_t>& ops,
+                                const Granularity& granularity,
+                                const std::vector<size_t>& retained_inputs,
+                                const std::vector<size_t>& retained_outputs,
+                                GroupMetrics* metrics) {
+    if (metrics == nullptr) {
+        return false;
     }
 
-    const auto& ref_out =
-        problem.tensors[problem.ops[ops.front()].outputs.front()];
-    const int64_t tile_w = std::max<int64_t>(1, granularity.width);
-    const int64_t tile_h = std::max<int64_t>(1, granularity.height);
-    const int64_t tile_k = std::max<int64_t>(1, granularity.depth);
-    const int64_t native_w = std::max<int64_t>(1, problem.native_granularity.width);
-    const int64_t spatial_tiles =
-        CeilDivInt(ref_out.width, tile_w) * CeilDivInt(ref_out.height, tile_h);
-    (void)native_w;
+    ScoreCacheKey key{ops, granularity, retained_inputs, retained_outputs};
+    std::sort(key.retained_inputs.begin(), key.retained_inputs.end());
+    key.retained_inputs.erase(
+        std::unique(key.retained_inputs.begin(), key.retained_inputs.end()),
+        key.retained_inputs.end());
+    std::sort(key.retained_outputs.begin(), key.retained_outputs.end());
+    key.retained_outputs.erase(
+        std::unique(key.retained_outputs.begin(), key.retained_outputs.end()),
+        key.retained_outputs.end());
 
-    int64_t max_k_steps = 1;
-    for (size_t op_id : ops) {
-        if (IsMatMul(problem.ops[op_id])) {
-            max_k_steps = std::max(max_k_steps,
-                                   CeilDivInt(MatMulK(problem, op_id), tile_k));
-        }
+    auto cached = g_score_cache.find(key);
+    if (cached != g_score_cache.end()) {
+        *metrics = cached->second;
+        return metrics->valid;
     }
 
-    std::unordered_set<size_t> op_set(ops.begin(), ops.end());
-    double total_latency = 0.0;
+    Subgraph subgraph;
+    subgraph.op_ids = ops;
+    subgraph.granularity = granularity;
+    subgraph.tensors_to_retain = key.retained_outputs;
+    subgraph.traversal_order = std::nullopt;
+    subgraph.subgraph_latency = 0.0;
 
-    for (int64_t tile = 0; tile < spatial_tiles; ++tile) {
-        const int64_t row_tile = tile / CeilDivInt(ref_out.width, tile_w);
-        const int64_t col_tile = tile % CeilDivInt(ref_out.width, tile_w);
-        const int64_t actual_h =
-            std::min<int64_t>(tile_h, ref_out.height - row_tile * tile_h);
-        const int64_t actual_w =
-            std::min<int64_t>(tile_w, ref_out.width - col_tile * tile_w);
-        for (int64_t step = 0; step < max_k_steps; ++step) {
-            StepEstimate estimate = EstimateStep(problem, graph, ops, boundary,
-                                                 granularity, actual_h, actual_w,
-                                                 step, max_k_steps);
-            double memory_in = static_cast<double>(estimate.active_bytes);
-            for (size_t tensor_id : boundary.boundary_inputs) {
-                if (retained_inputs.count(tensor_id)) {
-                    const auto& tensor = problem.tensors[tensor_id];
-                    if (IsPointwise(problem.ops[ops.front()])) {
-                        memory_in -= static_cast<double>(actual_h * actual_w);
-                    } else {
-                        (void)tensor;
-                    }
-                }
-            }
-            // Recompute the memory-in term with retain-awareness using the exact
-            // per-op input accounting logic.
-            memory_in = 0.0;
-            const int64_t k_begin = step * tile_k;
-            const bool final_k_step = (step == max_k_steps - 1);
-            for (size_t op_id : ops) {
-                const auto& op = problem.ops[op_id];
-                if (IsPointwise(op)) {
-                    if (!final_k_step) {
-                        continue;
-                    }
-                    for (size_t tensor_id : op.inputs) {
-                        int producer = graph.producer_of_tensor[tensor_id];
-                        if (producer >= 0 &&
-                            op_set.count(static_cast<size_t>(producer))) {
-                            continue;
-                        }
-                        if (!retained_inputs.count(tensor_id)) {
-                            memory_in += static_cast<double>(actual_h * actual_w);
-                        }
-                    }
-                } else if (IsMatMul(op)) {
-                    const int64_t k_total = MatMulK(problem, op_id);
-                    if (k_begin >= k_total) {
-                        continue;
-                    }
-                    const int64_t k_step =
-                        std::min<int64_t>(tile_k, k_total - k_begin);
-                    for (size_t input_index = 0; input_index < op.inputs.size();
-                         ++input_index) {
-                        size_t tensor_id = op.inputs[input_index];
-                        int producer = graph.producer_of_tensor[tensor_id];
-                        if (producer >= 0 &&
-                            op_set.count(static_cast<size_t>(producer))) {
-                            continue;
-                        }
-                        if (retained_inputs.count(tensor_id)) {
-                            continue;
-                        }
-                        if (input_index == 0) {
-                            memory_in += static_cast<double>(actual_h * k_step);
-                        } else {
-                            memory_in += static_cast<double>(actual_w * k_step);
-                        }
-                    }
-                }
-            }
-
-            double memory_out = 0.0;
-            if (final_k_step) {
-                for (size_t tensor_id : boundary.boundary_outputs) {
-                    if (!retained_outputs.count(tensor_id)) {
-                        memory_out += static_cast<double>(actual_h * actual_w);
-                    }
-                }
-            }
-
-            total_latency += std::max(estimate.compute_cost,
-                         (memory_in + memory_out) /
-                             static_cast<double>(problem.slow_memory_bandwidth));
-        }
+    SubgraphEvaluation evaluation;
+    if (!EvaluateSubgraph(problem, subgraph, key.retained_inputs, &evaluation) ||
+        !evaluation.valid) {
+        g_score_cache[key] = *metrics;
+        return false;
     }
 
-    return total_latency;
+    metrics->valid = true;
+    metrics->latency = evaluation.latency;
+    metrics->working_set_bytes = evaluation.peak_live_bytes;
+    g_score_cache[key] = *metrics;
+    return true;
 }
 
 GroupMetrics EvaluateGroup(const Problem& problem, const OpGraph& graph,
@@ -530,20 +892,30 @@ GroupMetrics EvaluateGroup(const Problem& problem, const OpGraph& graph,
         return metrics;
     }
 
-    metrics.latency =
-        EstimateLatency(problem, graph, ops, boundary, granularity);
-    metrics.valid = std::isfinite(metrics.latency);
-    return metrics;
+    GroupMetrics aligned_metrics;
+    if (!EvaluateWithOfficialScorer(problem, ops, granularity, {}, {},
+                                    &aligned_metrics)) {
+        return metrics;
+    }
+    aligned_metrics.working_set_bytes =
+        std::max(aligned_metrics.working_set_bytes, metrics.working_set_bytes);
+    return aligned_metrics;
 }
 
 CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
-                                  size_t start, size_t end) {
+                                  const std::vector<size_t>& input_ops,
+                                  const OptimusConfig& config) {
     CandidateGroup candidate;
-    candidate.start = start;
-    candidate.end = end;
-    for (size_t i = start; i <= end; ++i) {
-        candidate.ops.push_back(graph.topo_order[i]);
+    candidate.ops = input_ops;
+    std::sort(candidate.ops.begin(), candidate.ops.end(),
+              [&](size_t lhs, size_t rhs) {
+                  return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+              });
+    if (candidate.ops.empty()) {
+        return candidate;
     }
+    candidate.start = graph.topo_pos[candidate.ops.front()];
+    candidate.end = graph.topo_pos[candidate.ops.back()];
 
     if (!SharesCommonOutputShape(problem, candidate.ops)) {
         return candidate;
@@ -568,25 +940,92 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
     const auto height_candidates =
         BuildSpatialCandidates(ref_out.height, problem.native_granularity.height);
     const auto k_candidates = BuildKCandidates(problem, candidate.ops);
+    std::vector<std::pair<double, Granularity>> proxy_ranked;
 
     for (int64_t width : width_candidates) {
         for (int64_t height : height_candidates) {
             for (int64_t depth : k_candidates) {
                 Granularity granularity{width, height, depth};
-                GroupMetrics metrics = EvaluateGroup(
+                const int64_t working_set = EstimateWorkingSetBytes(
                     problem, graph, candidate.ops, candidate.boundary, granularity);
-                if (!metrics.valid) {
+                if (working_set > problem.fast_memory_capacity) {
                     continue;
                 }
-                if (!candidate.metrics.valid || metrics.latency < candidate.metrics.latency) {
-                    candidate.granularity = granularity;
-                    candidate.metrics = metrics;
+                double proxy_score = EstimateProxyLatency(
+                    problem, graph, candidate.ops, candidate.boundary, granularity);
+                if (config.guidance_mode == GuidanceMode::kConvAccelerator) {
+                    if (config.conv_guidance_variant ==
+                        ConvGuidanceVariant::kAdditivePenaltyV1) {
+                        const ConvGuidanceMetrics conv_metrics =
+                            AnalyzeConvGuidance(problem, graph, candidate.ops, granularity);
+                        if (conv_metrics.valid) {
+                            if (conv_metrics.working_set_bytes >
+                                problem.fast_memory_capacity) {
+                                continue;
+                            }
+                            proxy_score += 0.35 * conv_metrics.ranking_penalty;
+                        }
+                    }
                 }
+                proxy_ranked.push_back({proxy_score, granularity});
             }
         }
     }
 
+    // Add analytically-derived max-tile candidates (Paper Eq. 4, ISOA).
+    // For each k_step already in proxy_ranked, solve for the largest tile that
+    // fits within fast_memory_capacity, accounting for parameter refill cost.
+    {
+        std::set<int64_t> tried_k;
+        for (auto& [score, gran] : proxy_ranked) {
+            tried_k.insert(gran.depth);
+        }
+        std::vector<int64_t> k_steps_to_try(tried_k.begin(), tried_k.end());
+        if (k_steps_to_try.empty()) {
+            k_steps_to_try = BuildKCandidates(problem, candidate.ops);
+        }
+        AddAnalyticalTileCandidates(problem, graph, candidate.ops,
+                                     candidate.boundary, k_steps_to_try,
+                                     &proxy_ranked);
+    }
+
+    std::sort(proxy_ranked.begin(), proxy_ranked.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.first < rhs.first;
+              });
+    if (config.guidance_mode == GuidanceMode::kConvAccelerator &&
+        config.conv_guidance_variant == ConvGuidanceVariant::kLocalRerankV2) {
+        ApplyConvLocalRerankV2(problem, graph, candidate.ops, &proxy_ranked);
+    }
+    if (proxy_ranked.empty()) {
+        return candidate;
+    }
+
+    const size_t budget = std::min(kGranularityRefineBudget, proxy_ranked.size());
+    for (size_t i = 0; i < budget; ++i) {
+        GroupMetrics metrics = EvaluateGroup(problem, graph, candidate.ops,
+                                             candidate.boundary,
+                                             proxy_ranked[i].second);
+        if (!metrics.valid) {
+            continue;
+        }
+        if (!candidate.metrics.valid || metrics.latency < candidate.metrics.latency) {
+            candidate.granularity = proxy_ranked[i].second;
+            candidate.metrics = metrics;
+        }
+    }
+
     return candidate;
+}
+
+CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
+                                  size_t start, size_t end,
+                                  const OptimusConfig& config) {
+    std::vector<size_t> ops;
+    for (size_t i = start; i <= end; ++i) {
+        ops.push_back(graph.topo_order[i]);
+    }
+    return BuildBestCandidate(problem, graph, ops, config);
 }
 
 size_t EstimateMaxGroupSize(const Problem& problem) {
@@ -594,20 +1033,23 @@ size_t EstimateMaxGroupSize(const Problem& problem) {
         std::max<int64_t>(1, problem.native_granularity.width) *
         std::max<int64_t>(1, problem.native_granularity.height);
     if (native_tile <= 0) {
-        return 2;
+        return 4;
     }
     const int64_t ratio = problem.fast_memory_capacity / native_tile;
     if (ratio <= 2) {
         return 2;
     }
+    if (ratio <= 4) {
+        return 4;
+    }
     if (ratio <= 8) {
-        return 3;
+        return 6;
     }
     return kDefaultMaxGroupSize;
 }
 
 std::vector<std::vector<CandidateGroup>> GenerateCandidates(
-    const Problem& problem, const OpGraph& graph) {
+    const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
     const size_t n = graph.topo_order.size();
     const size_t max_group_size = EstimateMaxGroupSize(problem);
     std::vector<std::vector<CandidateGroup>> by_start(n);
@@ -616,7 +1058,7 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
         for (size_t end = start;
              end < n && end < start + max_group_size; ++end) {
             CandidateGroup candidate =
-                BuildBestCandidate(problem, graph, start, end);
+                BuildBestCandidate(problem, graph, start, end, config);
             if (!candidate.metrics.valid) {
                 continue;
             }
@@ -635,7 +1077,7 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
 
         if (by_start[start].empty()) {
             CandidateGroup fallback =
-                BuildBestCandidate(problem, graph, start, start);
+                BuildBestCandidate(problem, graph, start, start, config);
             if (fallback.metrics.valid) {
                 by_start[start].push_back(std::move(fallback));
             }
@@ -645,159 +1087,971 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
     return by_start;
 }
 
-std::vector<size_t> ChooseRetainedOutputs(
+bool IsContiguousTopoSpan(const OpGraph& graph, const CandidateGroup& candidate) {
+    if (candidate.ops.empty()) {
+        return false;
+    }
+    if (candidate.ops.size() != candidate.end - candidate.start + 1) {
+        return false;
+    }
+    for (size_t i = 0; i < candidate.ops.size(); ++i) {
+        if (candidate.ops[i] != graph.topo_order[candidate.start + i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
+    const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
+    const size_t n = graph.topo_order.size();
+    const size_t max_group_size = EstimateMaxGroupSize(problem);
+    std::vector<std::vector<CandidateGroup>> by_start(n);
+
+    for (size_t topo_idx = 0; topo_idx < n; ++topo_idx) {
+        const size_t seed = graph.topo_order[topo_idx];
+        std::queue<std::vector<size_t>> pending;
+        std::set<std::vector<size_t>> seen;
+        pending.push({seed});
+        seen.insert({seed});
+
+        while (!pending.empty()) {
+            std::vector<size_t> current_ops = pending.front();
+            pending.pop();
+
+            CandidateGroup candidate =
+                BuildBestCandidate(problem, graph, current_ops, config);
+            if (candidate.metrics.valid && IsContiguousTopoSpan(graph, candidate)) {
+                if (candidate.ops.size() == 1 || candidate.internalized_bytes >=
+                        std::max<int64_t>(1, problem.native_granularity.width) *
+                            std::max<int64_t>(1, problem.native_granularity.height)) {
+                    by_start[candidate.start].push_back(candidate);
+                }
+            }
+
+            if (current_ops.size() >= max_group_size) {
+                continue;
+            }
+
+            std::unordered_set<size_t> current_set(current_ops.begin(), current_ops.end());
+            std::unordered_set<size_t> frontier;
+            for (size_t op_id : current_ops) {
+                for (size_t succ : graph.succs[op_id]) {
+                    if (!current_set.count(succ)) {
+                        frontier.insert(succ);
+                    }
+                }
+            }
+
+            for (size_t next_op : frontier) {
+                std::vector<size_t> grown_ops = current_ops;
+                grown_ops.push_back(next_op);
+                std::sort(grown_ops.begin(), grown_ops.end(),
+                          [&](size_t lhs, size_t rhs) {
+                              return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+                          });
+                if (seen.insert(grown_ops).second) {
+                    pending.push(grown_ops);
+                }
+            }
+        }
+    }
+
+    for (size_t start = 0; start < n; ++start) {
+        auto& candidates = by_start[start];
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                      if (lhs.ops == rhs.ops) {
+                          return lhs.metrics.latency < rhs.metrics.latency;
+                      }
+                      return lhs.ops < rhs.ops;
+                  });
+        candidates.erase(
+            std::unique(candidates.begin(), candidates.end(),
+                        [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                            return lhs.ops == rhs.ops;
+                        }),
+            candidates.end());
+
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                      const double lhs_solo = static_cast<double>(lhs.ops.size());
+                      const double rhs_solo = static_cast<double>(rhs.ops.size());
+                      const double lhs_density = lhs.internalized_bytes -
+                                                 lhs.metrics.latency / lhs_solo;
+                      const double rhs_density = rhs.internalized_bytes -
+                                                 rhs.metrics.latency / rhs_solo;
+                      if (lhs_density != rhs_density) {
+                          return lhs_density > rhs_density;
+                      }
+                      return lhs.metrics.latency < rhs.metrics.latency;
+                  });
+        if (candidates.size() > 8) {
+            candidates.resize(8);
+        }
+
+        if (candidates.empty()) {
+            CandidateGroup fallback =
+                BuildBestCandidate(problem, graph, {graph.topo_order[start]}, config);
+            if (fallback.metrics.valid) {
+                candidates.push_back(std::move(fallback));
+            }
+        }
+
+        if (SeedDebugEnabled()) {
+            std::cerr << "seed start " << start << " candidates=" << candidates.size() << "\n";
+            for (const auto& candidate : candidates) {
+                std::cerr << "  ops:";
+                for (size_t op_id : candidate.ops) {
+                    std::cerr << " " << op_id;
+                }
+                std::cerr << " lat=" << candidate.metrics.latency
+                          << " internal=" << candidate.internalized_bytes << "\n";
+            }
+        }
+    }
+
+    return by_start;
+}
+
+std::vector<size_t> FilterRetainedInputsForCandidate(
+    const CandidateGroup& candidate,
+    const std::vector<size_t>& retained_inputs) {
+    std::unordered_set<size_t> boundary_inputs(candidate.boundary.boundary_inputs.begin(),
+                                               candidate.boundary.boundary_inputs.end());
+    std::vector<size_t> filtered;
+    for (size_t tensor_id : retained_inputs) {
+        if (boundary_inputs.count(tensor_id)) {
+            filtered.push_back(tensor_id);
+        }
+    }
+    std::sort(filtered.begin(), filtered.end());
+    filtered.erase(std::unique(filtered.begin(), filtered.end()), filtered.end());
+    return filtered;
+}
+
+std::vector<size_t> CanonicalizeRetainedInputs(
+    const std::vector<size_t>& retained_inputs,
+    const std::unordered_set<size_t>& useful_inputs) {
+    std::vector<size_t> canonical;
+    canonical.reserve(retained_inputs.size());
+    for (size_t tensor_id : retained_inputs) {
+        if (useful_inputs.count(tensor_id)) {
+            canonical.push_back(tensor_id);
+        }
+    }
+    std::sort(canonical.begin(), canonical.end());
+    canonical.erase(std::unique(canonical.begin(), canonical.end()), canonical.end());
+    return canonical;
+}
+
+std::vector<std::vector<size_t>> EnumerateRetainChoices(
     const Problem& problem, const CandidateGroup& current,
-    const CandidateGroup& next,
-    const std::unordered_set<size_t>& retained_prev) {
-    std::unordered_set<size_t> next_inputs(next.boundary.boundary_inputs.begin(),
-                                           next.boundary.boundary_inputs.end());
-    std::vector<size_t> candidates;
-    for (size_t tensor_id : current.boundary.boundary_outputs) {
-        if (next_inputs.count(tensor_id)) {
-            candidates.push_back(tensor_id);
-        }
-    }
-    if (candidates.empty()) {
-        return {};
-    }
-
-    int64_t retained_prev_bytes = 0;
-    for (size_t tensor_id : current.boundary.boundary_inputs) {
-        if (retained_prev.count(tensor_id)) {
-            retained_prev_bytes += TensorElements(problem.tensors[tensor_id]);
-        }
-    }
-
-    const int64_t next_limit =
-        problem.fast_memory_capacity - next.metrics.working_set_bytes;
+    const CandidateGroup& next, const std::vector<size_t>& retained_inputs) {
+    const int64_t retained_in_bytes =
+        TensorBytesForSet(problem, retained_inputs);
     const int64_t current_limit = problem.fast_memory_capacity -
                                   current.metrics.working_set_bytes -
-                                  retained_prev_bytes;
-    const int64_t available_bytes = std::min(next_limit, current_limit);
-    if (available_bytes <= 0) {
-        return {};
+                                  retained_in_bytes;
+    const int64_t next_limit =
+        problem.fast_memory_capacity - next.metrics.working_set_bytes;
+    const int64_t available_bytes = std::min(current_limit, next_limit);
+
+    std::unordered_set<size_t> next_inputs(next.boundary.boundary_inputs.begin(),
+                                           next.boundary.boundary_inputs.end());
+    std::vector<size_t> shareable_outputs;
+    for (size_t tensor_id : current.boundary.boundary_outputs) {
+        if (next_inputs.count(tensor_id)) {
+            shareable_outputs.push_back(tensor_id);
+        }
+    }
+    std::sort(shareable_outputs.begin(), shareable_outputs.end());
+
+    std::vector<std::vector<size_t>> choices;
+    choices.push_back({});
+    if (shareable_outputs.empty() || available_bytes <= 0) {
+        return choices;
     }
 
-    if (candidates.size() <= 12) {
-        std::vector<size_t> best;
-        int64_t best_bytes = 0;
-        const size_t total = static_cast<size_t>(1) << candidates.size();
+    if (shareable_outputs.size() <= 12) {
+        const size_t total = static_cast<size_t>(1) << shareable_outputs.size();
         for (size_t mask = 1; mask < total; ++mask) {
             int64_t bytes = 0;
             std::vector<size_t> chosen;
-            for (size_t i = 0; i < candidates.size(); ++i) {
+            for (size_t i = 0; i < shareable_outputs.size(); ++i) {
                 if ((mask >> i) & 1U) {
-                    bytes += TensorElements(problem.tensors[candidates[i]]);
-                    chosen.push_back(candidates[i]);
+                    bytes += TensorElements(problem.tensors[shareable_outputs[i]]);
+                    chosen.push_back(shareable_outputs[i]);
                 }
             }
-            if (bytes <= available_bytes && bytes > best_bytes) {
-                best_bytes = bytes;
-                best = std::move(chosen);
+            if (bytes <= available_bytes) {
+                choices.push_back(std::move(chosen));
             }
         }
-        std::sort(best.begin(), best.end());
-        return best;
-    }
-
-    std::sort(candidates.begin(), candidates.end(),
-              [&](size_t lhs, size_t rhs) {
-                  return TensorElements(problem.tensors[lhs]) >
-                         TensorElements(problem.tensors[rhs]);
-              });
-    std::vector<size_t> chosen;
-    int64_t used_bytes = 0;
-    for (size_t tensor_id : candidates) {
-        int64_t tensor_bytes = TensorElements(problem.tensors[tensor_id]);
-        if (used_bytes + tensor_bytes <= available_bytes) {
-            used_bytes += tensor_bytes;
-            chosen.push_back(tensor_id);
+    } else {
+        std::sort(shareable_outputs.begin(), shareable_outputs.end(),
+                  [&](size_t lhs, size_t rhs) {
+                      return TensorElements(problem.tensors[lhs]) >
+                             TensorElements(problem.tensors[rhs]);
+                  });
+        std::vector<size_t> prefix_choice;
+        int64_t prefix_bytes = 0;
+        for (size_t tensor_id : shareable_outputs) {
+            const int64_t tensor_bytes = TensorElements(problem.tensors[tensor_id]);
+            if (prefix_bytes + tensor_bytes > available_bytes) {
+                continue;
+            }
+            prefix_bytes += tensor_bytes;
+            prefix_choice.push_back(tensor_id);
+            std::vector<size_t> chosen = prefix_choice;
+            std::sort(chosen.begin(), chosen.end());
+            choices.push_back(std::move(chosen));
+        }
+        for (size_t tensor_id : shareable_outputs) {
+            const int64_t tensor_bytes = TensorElements(problem.tensors[tensor_id]);
+            if (tensor_bytes <= available_bytes) {
+                choices.push_back({tensor_id});
+            }
         }
     }
-    std::sort(chosen.begin(), chosen.end());
-    return chosen;
+
+    std::sort(choices.begin(), choices.end());
+    choices.erase(std::unique(choices.begin(), choices.end()), choices.end());
+    return choices;
 }
 
-Solution RecomputeScheduleLatencies(const Problem& problem, const OpGraph& graph,
-                                    const std::vector<CandidateGroup>& schedule) {
-    Solution solution;
-    if (schedule.empty()) {
-        return solution;
+bool IsCapacityFeasible(const Problem& problem, const CandidateGroup& current,
+                        const std::vector<size_t>& retained_inputs,
+                        const std::vector<size_t>& retained_outputs) {
+    const int64_t retained_in_bytes =
+        TensorBytesForSet(problem, retained_inputs);
+    const int64_t retained_out_bytes =
+        TensorBytesForSet(problem, retained_outputs);
+    return current.metrics.working_set_bytes + retained_in_bytes +
+               retained_out_bytes <=
+           problem.fast_memory_capacity;
+}
+
+SearchDecision SolveFromState(
+    const Problem& problem, const OpGraph& graph,
+    const std::vector<std::vector<CandidateGroup>>& candidates,
+    const std::vector<std::unordered_set<size_t>>& useful_inputs_by_start,
+    size_t start, const std::vector<size_t>& retained_inputs,
+    std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash>* memo) {
+    const size_t n = candidates.size();
+    if (start >= n) {
+        SearchDecision terminal;
+        terminal.valid = retained_inputs.empty();
+        terminal.cost = terminal.valid ? 0.0 : kInfinity;
+        return terminal;
     }
 
-    std::vector<std::vector<size_t>> retained(schedule.size());
-    std::unordered_set<size_t> retained_prev;
-    for (size_t i = 0; i + 1 < schedule.size(); ++i) {
-        retained[i] = ChooseRetainedOutputs(problem, schedule[i], schedule[i + 1],
-                                            retained_prev);
-        retained_prev.clear();
-        retained_prev.insert(retained[i].begin(), retained[i].end());
+    const SearchStateKey key{
+        start, CanonicalizeRetainedInputs(retained_inputs, useful_inputs_by_start[start])};
+    auto it = memo->find(key);
+    if (it != memo->end()) {
+        return it->second;
     }
+
+    SearchDecision best;
+
+    for (size_t cand_idx = 0; cand_idx < candidates[start].size(); ++cand_idx) {
+        const auto& candidate = candidates[start][cand_idx];
+        const std::vector<size_t> incoming_used =
+            FilterRetainedInputsForCandidate(candidate, key.retained_inputs);
+        const size_t next_start = candidate.end + 1;
+
+        if (next_start >= n) {
+            if (!IsCapacityFeasible(problem, candidate, incoming_used, {})) {
+                continue;
+            }
+                const double current_cost =
+                [&]() {
+                    GroupMetrics metrics;
+                    if (!EvaluateWithOfficialScorer(problem, candidate.ops,
+                                                    candidate.granularity,
+                                                    incoming_used, {}, &metrics)) {
+                        return kInfinity;
+                    }
+                    return metrics.latency;
+                }();
+            if (current_cost < best.cost) {
+                best.valid = true;
+                best.cost = current_cost;
+                best.candidate_index = cand_idx;
+                best.retained_outputs.clear();
+            }
+            continue;
+        }
+
+        for (const auto& next_candidate : candidates[next_start]) {
+            const auto retain_choices = EnumerateRetainChoices(
+                problem, candidate, next_candidate, incoming_used);
+            for (const auto& retained_outputs : retain_choices) {
+                if (!IsCapacityFeasible(problem, candidate, incoming_used,
+                                        retained_outputs)) {
+                    continue;
+                }
+                GroupMetrics scored_metrics;
+                if (!EvaluateWithOfficialScorer(problem, candidate.ops,
+                                                candidate.granularity,
+                                                incoming_used, retained_outputs,
+                                                &scored_metrics)) {
+                    continue;
+                }
+                const double current_cost = scored_metrics.latency;
+                const SearchDecision future = SolveFromState(
+                    problem, graph, candidates, useful_inputs_by_start, next_start,
+                    retained_outputs, memo);
+                if (!future.valid) {
+                    continue;
+                }
+
+                const double total_cost = current_cost + future.cost;
+                if (total_cost < best.cost) {
+                    best.valid = true;
+                    best.cost = total_cost;
+                    best.candidate_index = cand_idx;
+                    best.retained_outputs = retained_outputs;
+                }
+            }
+        }
+    }
+
+    (*memo)[key] = best;
+    return best;
+}
+
+Solution BuildSolutionFromSchedule(
+    const Problem& problem, const std::vector<CandidateGroup>& schedule) {
+    Solution solution;
+    std::vector<size_t> retained_inputs;
 
     for (size_t i = 0; i < schedule.size(); ++i) {
-        std::unordered_set<size_t> retained_inputs;
-        if (i > 0) {
-            retained_inputs.insert(retained[i - 1].begin(), retained[i - 1].end());
-        }
-        std::unordered_set<size_t> retained_outputs(retained[i].begin(),
-                                                    retained[i].end());
-
+        const auto& candidate = schedule[i];
+        const std::vector<size_t> incoming_used =
+            FilterRetainedInputsForCandidate(candidate, retained_inputs);
         Subgraph subgraph;
-        subgraph.op_ids = schedule[i].ops;
-        subgraph.granularity = schedule[i].granularity;
-        subgraph.tensors_to_retain = retained[i];
+        subgraph.op_ids = candidate.ops;
+        subgraph.granularity = candidate.granularity;
+        if (i + 1 < schedule.size()) {
+            const auto retain_choices = EnumerateRetainChoices(
+                problem, candidate, schedule[i + 1], incoming_used);
+            if (!retain_choices.empty()) {
+                subgraph.tensors_to_retain = retain_choices.back();
+            }
+        }
         subgraph.traversal_order = std::nullopt;
-        subgraph.subgraph_latency = EstimateLatency(
-            problem, graph, schedule[i].ops, schedule[i].boundary,
-            schedule[i].granularity, retained_inputs, retained_outputs);
+        GroupMetrics scored_metrics;
+        if (!EvaluateWithOfficialScorer(problem, candidate.ops,
+                                        candidate.granularity,
+                                        incoming_used,
+                                        subgraph.tensors_to_retain,
+                                        &scored_metrics)) {
+            break;
+        }
+        subgraph.subgraph_latency = scored_metrics.latency;
         solution.subgraphs.push_back(std::move(subgraph));
+
+        retained_inputs = solution.subgraphs.back().tensors_to_retain;
     }
 
     return solution;
 }
 
-}  // namespace
+Solution BuildSolutionFromSearch(
+    const Problem& problem, const OpGraph& /*graph*/,
+    const std::vector<std::vector<CandidateGroup>>& candidates,
+    const std::vector<std::unordered_set<size_t>>& useful_inputs_by_start,
+    const std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash>& memo) {
+    std::vector<CandidateGroup> schedule;
+    size_t start = 0;
+    std::vector<size_t> retained_inputs;
 
-Solution SolveWithOptimus(const Problem& problem) {
-    const OpGraph graph = BuildOpGraph(problem);
-    const auto candidates = GenerateCandidates(problem, graph);
-    const size_t n = graph.topo_order.size();
+    while (start < candidates.size()) {
+        const SearchStateKey key{
+            start,
+            CanonicalizeRetainedInputs(retained_inputs, useful_inputs_by_start[start])};
+        auto it = memo.find(key);
+        if (it == memo.end() || !it->second.valid ||
+            it->second.candidate_index >= candidates[start].size()) {
+            break;
+        }
+        schedule.push_back(candidates[start][it->second.candidate_index]);
+        retained_inputs = it->second.retained_outputs;
+        start = schedule.back().end + 1;
+    }
 
-    std::vector<DpState> dp(n + 1);
-    dp[n].cost = 0.0;
-    dp[n].next_index = n;
-    dp[n].candidate_index = 0;
+    return BuildSolutionFromSchedule(problem, schedule);
+}
 
-    for (size_t i = n; i-- > 0;) {
-        for (size_t cand_idx = 0; cand_idx < candidates[i].size(); ++cand_idx) {
-            const auto& candidate = candidates[i][cand_idx];
-            const size_t next = candidate.end + 1;
-            if (!std::isfinite(dp[next].cost)) {
-                continue;
-            }
-            const double cost = candidate.metrics.latency + dp[next].cost;
-            if (cost < dp[i].cost) {
-                dp[i].cost = cost;
-                dp[i].next_index = next;
-                dp[i].candidate_index = cand_idx;
+// ============================================================================
+// PAPER ALGORITHM IMPLEMENTATIONS: Optimus (Cai et al., TECS 2022)
+// ============================================================================
+
+// ---- Point 3: ISValid from Algorithm 1 ----
+
+// Forward BFS from start_node following successor edges.
+// Returns true if any node in target_set is reachable.
+bool CanReachOpSet(const OpGraph& graph,
+                   size_t start_node,
+                   const std::unordered_set<size_t>& target_set) {
+    std::queue<size_t> q;
+    std::unordered_set<size_t> visited;
+    q.push(start_node);
+    visited.insert(start_node);
+    while (!q.empty()) {
+        size_t node = q.front();
+        q.pop();
+        if (target_set.count(node)) {
+            return true;
+        }
+        for (size_t succ : graph.succs[node]) {
+            if (!visited.count(succ)) {
+                visited.insert(succ);
+                q.push(succ);
             }
         }
     }
+    return false;
+}
 
-    std::vector<CandidateGroup> schedule;
-    for (size_t i = 0; i < n;) {
-        if (candidates[i].empty() || !std::isfinite(dp[i].cost)) {
-            CandidateGroup fallback = BuildBestCandidate(problem, graph, i, i);
-            schedule.push_back(std::move(fallback));
-            ++i;
+// Paper Algorithm 1, ISValid (lines 24-30):
+// Returns true if it is valid to fuse v0 into the existing group G'.
+// Invalid when any successor of v0 is outside G' but can reach G' through
+// an external path, which would create a cycle in the partition DAG.
+bool IsFusionValid(const OpGraph& graph,
+                   const std::unordered_set<size_t>& group_set,
+                   size_t v0) {
+    for (size_t c : graph.succs[v0]) {
+        if (group_set.count(c)) {
+            continue;  // c is in the group, no issue
+        }
+        if (CanReachOpSet(graph, c, group_set)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---- Points 4 & 6: ISOA + Analytical tile sizing (Paper Section 5.2, Eq. 4) ----
+// With ISOA, only one spatial tile of each intermediate tensor is live at a time.
+// Buffer formula: area_coeff * tile_h * tile_w
+//                + row_coeff * tile_h * k_step   (MatMul LHS slices)
+//                + col_coeff * tile_w * k_step   (MatMul RHS / weight slices)
+// This models the parameter-refill cost (Point 5) via col_coeff * k_step.
+
+struct TileBufferCoeffs {
+    double area_coeff = 0.0;  // coefficient of tile_h * tile_w
+    double row_coeff  = 0.0;  // coefficient of tile_h * k_step  (LHS slices)
+    double col_coeff  = 0.0;  // coefficient of tile_w * k_step  (RHS/weight slices)
+};
+
+TileBufferCoeffs ComputeBufferCoeffs(const Problem& problem,
+                                      const OpGraph& graph,
+                                      const std::vector<size_t>& ops,
+                                      const GroupBoundary& boundary) {
+    TileBufferCoeffs coeffs;
+    std::unordered_set<size_t> op_set(ops.begin(), ops.end());
+    std::unordered_set<size_t> boundary_out_set(boundary.boundary_outputs.begin(),
+                                                 boundary.boundary_outputs.end());
+    for (size_t op_id : ops) {
+        const auto& op = problem.ops[op_id];
+        if (IsMatMul(op)) {
+            // LHS (activation slice): tile_h * k_step per step
+            if (!op.inputs.empty()) {
+                int p = graph.producer_of_tensor[op.inputs[0]];
+                if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                    coeffs.row_coeff += 1.0;
+                }
+            }
+            // RHS (weight slice, refill cost — Point 5): tile_w * k_step per step
+            if (op.inputs.size() >= 2) {
+                int p = graph.producer_of_tensor[op.inputs[1]];
+                if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                    coeffs.col_coeff += 1.0;
+                }
+            }
+            // Output partial sum accumulator: tile_h * tile_w
+            coeffs.area_coeff += 1.0;
+        } else if (IsPointwise(op)) {
+            // Each external boundary input: tile_h * tile_w
+            // (with ISOA, only the current tile is live — not the full tensor)
+            for (size_t t : op.inputs) {
+                int p = graph.producer_of_tensor[t];
+                if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                    coeffs.area_coeff += 1.0;
+                }
+            }
+            // Output tile: tile_h * tile_w
+            if (boundary_out_set.count(op.outputs.front())) {
+                coeffs.area_coeff += 1.0;
+            }
+        }
+    }
+    return coeffs;
+}
+
+// Solve: A_r * x^2 + B * x - C <= 0, find largest integer x >= 1.
+// A_r = area_coeff * ratio,  B = (row*ratio + col) * k_step,  C = fast_memory.
+// Returns 0 if infeasible.
+int64_t SolveQuadraticTileWidth(double A_r, double B, double C) {
+    if (C <= 0.0) {
+        return 0;
+    }
+    if (A_r <= 0.0) {
+        // Linear case: B * x <= C
+        if (B <= 0.0) {
+            return static_cast<int64_t>(1e15);
+        }
+        return static_cast<int64_t>(C / B);
+    }
+    // Quadratic: A_r * x^2 + B * x - C <= 0
+    // x = (-B + sqrt(B^2 + 4*A_r*C)) / (2*A_r)
+    double disc = B * B + 4.0 * A_r * C;
+    if (disc < 0.0) {
+        return 0;
+    }
+    double x = (-B + std::sqrt(disc)) / (2.0 * A_r);
+    if (x < 1.0) {
+        return 0;
+    }
+    return static_cast<int64_t>(x);
+}
+
+// Add analytically-derived max-tile candidates (Paper Eq. 4) to proxy_ranked.
+// For each k_step and several aspect ratios, solves the quadratic for max tile_w,
+// then adds the resulting Granularity if it passes the working-set check.
+void AddAnalyticalTileCandidates(const Problem& problem,
+                                  const OpGraph& graph,
+                                  const std::vector<size_t>& ops,
+                                  const GroupBoundary& boundary,
+                                  const std::vector<int64_t>& k_steps,
+                                  std::vector<std::pair<double, Granularity>>* proxy_ranked) {
+    if (ops.empty() || proxy_ranked == nullptr) {
+        return;
+    }
+    const auto& ref_out = problem.tensors[problem.ops[ops.front()].outputs.front()];
+    const int64_t out_h = std::max<int64_t>(1, ref_out.height);
+    const int64_t out_w = std::max<int64_t>(1, ref_out.width);
+    const double C = static_cast<double>(problem.fast_memory_capacity);
+
+    const TileBufferCoeffs coeffs = ComputeBufferCoeffs(problem, graph, ops, boundary);
+
+    // Try natural aspect ratio and 1:1
+    std::vector<double> ratios;
+    ratios.push_back(static_cast<double>(out_h) / static_cast<double>(out_w));
+    if (out_h != out_w) {
+        ratios.push_back(1.0);
+    }
+    ratios.push_back(static_cast<double>(out_w) / static_cast<double>(out_h));
+
+    for (int64_t k_step : k_steps) {
+        if (k_step <= 0) {
             continue;
         }
-        const auto& chosen = candidates[i][dp[i].candidate_index];
-        schedule.push_back(chosen);
-        i = dp[i].next_index;
+        for (double r : ratios) {
+            if (r <= 0.0) {
+                continue;
+            }
+            const double A_r = coeffs.area_coeff * r;
+            const double B   = (coeffs.row_coeff * r + coeffs.col_coeff) *
+                               static_cast<double>(k_step);
+            int64_t max_tw = SolveQuadraticTileWidth(A_r, B, C);
+            if (max_tw <= 0) {
+                continue;
+            }
+            int64_t tile_w = std::min<int64_t>(out_w, max_tw);
+            int64_t tile_h = std::min<int64_t>(
+                out_h, static_cast<int64_t>(r * static_cast<double>(tile_w)));
+            tile_h = std::max<int64_t>(1, tile_h);
+            tile_w = std::max<int64_t>(1, tile_w);
+
+            Granularity g{tile_w, tile_h, k_step};
+            // Verify the working set fits (proxy check)
+            int64_t ws = EstimateWorkingSetBytes(problem, graph, ops, boundary, g);
+            if (ws > problem.fast_memory_capacity) {
+                // Halve and retry
+                tile_w = std::max<int64_t>(1, tile_w / 2);
+                tile_h = std::max<int64_t>(1, tile_h / 2);
+                g = {tile_w, tile_h, k_step};
+                ws = EstimateWorkingSetBytes(problem, graph, ops, boundary, g);
+                if (ws > problem.fast_memory_capacity) {
+                    continue;
+                }
+            }
+            const double proxy_score =
+                EstimateProxyLatency(problem, graph, ops, boundary, g);
+            if (std::isfinite(proxy_score)) {
+                proxy_ranked->push_back({proxy_score, g});
+            }
+        }
+    }
+}
+
+// ---- Point 3: Bitmask DP for small N ----
+
+// A precomputed group candidate for the bitmask DP.
+// mask is indexed by topo_order position (bit i = op at topo_order[i]).
+struct BitmaskGroup {
+    uint64_t mask     = 0;
+    int v0_topo_idx   = -1;  // smallest topo position in the group
+    CandidateGroup candidate;
+};
+
+// Convert existing position-indexed candidates to BitmaskGroups.
+// Also checks IsFusionValid to filter out groups that create partition-DAG cycles.
+std::vector<BitmaskGroup> BuildBitmaskGroups(
+    const OpGraph& graph,
+    const std::vector<std::vector<CandidateGroup>>& candidates) {
+    const size_t n = graph.topo_order.size();
+    std::vector<BitmaskGroup> result;
+    std::unordered_set<uint64_t> seen_masks;
+
+    for (size_t start = 0; start < n; ++start) {
+        for (const auto& cand : candidates[start]) {
+            if (!cand.metrics.valid) {
+                continue;
+            }
+            // Compute bitmask over topo positions
+            uint64_t mask = 0;
+            for (size_t op_id : cand.ops) {
+                mask |= (1ULL << graph.topo_pos[op_id]);
+            }
+            if (!seen_masks.insert(mask).second) {
+                continue;
+            }
+
+            // ISValid check (Point 3): reject groups with partition-DAG cycles.
+            // For each op in the group acting as v0, verify adding it doesn't
+            // create a cyclic dependency.
+            std::unordered_set<size_t> group_set(cand.ops.begin(), cand.ops.end());
+            bool is_valid_partition = true;
+            for (size_t op_id : cand.ops) {
+                // Treat each op as if it were the "new" op being fused in
+                std::unordered_set<size_t> rest_of_group = group_set;
+                rest_of_group.erase(op_id);
+                if (rest_of_group.empty()) {
+                    break;  // single-op group always valid
+                }
+                if (!IsFusionValid(graph, rest_of_group, op_id)) {
+                    is_valid_partition = false;
+                    break;
+                }
+            }
+            if (!is_valid_partition) {
+                continue;
+            }
+
+            BitmaskGroup bg;
+            bg.mask = mask;
+            bg.v0_topo_idx = static_cast<int>(start);
+            bg.candidate = cand;
+            result.push_back(std::move(bg));
+        }
+    }
+    return result;
+}
+
+struct BitmaskDecision {
+    bool   valid     = false;
+    double cost      = kInfinity;
+    size_t group_idx = 0;
+};
+
+// Recursive bitmask DP with memoization.
+// covered: bitmask of topo positions already scheduled.
+// full_mask: bitmask with all n bits set.
+// groups_by_v0[i]: indices into groups for groups whose v0_topo_idx == i.
+double SolveBitmaskDPImpl(
+    const Problem& problem,
+    const OpGraph& graph,
+    const std::vector<BitmaskGroup>& groups,
+    const std::vector<std::vector<size_t>>& groups_by_v0,
+    size_t n,
+    uint64_t covered,
+    uint64_t full_mask,
+    std::unordered_map<uint64_t, BitmaskDecision>* memo) {
+    if (covered == full_mask) {
+        return 0.0;
+    }
+    auto it = memo->find(covered);
+    if (it != memo->end()) {
+        return it->second.valid ? it->second.cost : kInfinity;
     }
 
-    return RecomputeScheduleLatencies(problem, graph, schedule);
+    // Find the first uncovered op in topo order whose all predecessors are covered.
+    int v0_topo_idx = -1;
+    for (size_t i = 0; i < n; ++i) {
+        if ((covered >> i) & 1u) {
+            continue;
+        }
+        size_t op_id = graph.topo_order[i];
+        bool ready = true;
+        for (size_t pred : graph.preds[op_id]) {
+            if (!((covered >> graph.topo_pos[pred]) & 1u)) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready) {
+            v0_topo_idx = static_cast<int>(i);
+            break;
+        }
+    }
+    if (v0_topo_idx < 0) {
+        (*memo)[covered] = {};
+        return kInfinity;
+    }
+
+    BitmaskDecision best;
+    if (static_cast<size_t>(v0_topo_idx) < groups_by_v0.size()) {
+        for (size_t group_idx : groups_by_v0[v0_topo_idx]) {
+            const BitmaskGroup& bg = groups[group_idx];
+            // Group must not overlap already-covered ops
+            if (bg.mask & covered) {
+                continue;
+            }
+            // All ops in group must be ready (their preds are covered or internal)
+            bool group_ready = true;
+            for (size_t i = 0; i < n; ++i) {
+                if (!((bg.mask >> i) & 1u)) {
+                    continue;
+                }
+                size_t op_id = graph.topo_order[i];
+                for (size_t pred : graph.preds[op_id]) {
+                    size_t pred_topo = graph.topo_pos[pred];
+                    if (!((covered >> pred_topo) & 1u) &&
+                        !((bg.mask >> pred_topo) & 1u)) {
+                        group_ready = false;
+                        break;
+                    }
+                }
+                if (!group_ready) {
+                    break;
+                }
+            }
+            if (!group_ready) {
+                continue;
+            }
+
+            const double group_cost = bg.candidate.metrics.latency;
+            const uint64_t new_covered = covered | bg.mask;
+            const double future = SolveBitmaskDPImpl(
+                problem, graph, groups, groups_by_v0, n,
+                new_covered, full_mask, memo);
+            const double total = group_cost + future;
+            if (total < best.cost) {
+                best.valid     = true;
+                best.cost      = total;
+                best.group_idx = group_idx;
+            }
+        }
+    }
+
+    (*memo)[covered] = best;
+    return best.valid ? best.cost : kInfinity;
+}
+
+// Recover the ordered schedule from the bitmask DP memo.
+std::vector<CandidateGroup> RecoverBitmaskSchedule(
+    const std::vector<BitmaskGroup>& groups,
+    uint64_t full_mask,
+    const std::unordered_map<uint64_t, BitmaskDecision>& memo) {
+    std::vector<CandidateGroup> schedule;
+    uint64_t covered = 0;
+    while (covered != full_mask) {
+        auto it = memo.find(covered);
+        if (it == memo.end() || !it->second.valid) {
+            break;
+        }
+        const BitmaskGroup& bg = groups[it->second.group_idx];
+        schedule.push_back(bg.candidate);
+        covered |= bg.mask;
+    }
+    return schedule;
+}
+
+}  // namespace
+
+Solution SolveWithOptimusImpl(const Problem& problem, const OptimusConfig& config) {
+    g_score_cache.clear();
+    const OpGraph graph = BuildOpGraph(problem);
+    std::vector<std::vector<CandidateGroup>> candidates;
+    if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth) {
+        std::cerr << "Optimus candidates: seed-growth\n";
+        candidates = GenerateSeedGrowthCandidates(problem, graph, config);
+    } else {
+        std::cerr << "Optimus candidates: interval\n";
+        candidates = GenerateCandidates(problem, graph, config);
+    }
+    if (config.guidance_mode == GuidanceMode::kConvAccelerator) {
+        std::cerr << "Optimus guidance: conv_accelerator\n";
+    }
+    const size_t n = graph.topo_order.size();
+    std::vector<std::unordered_set<size_t>> useful_inputs_by_start(n);
+    for (size_t start = 0; start < n; ++start) {
+        for (const auto& candidate : candidates[start]) {
+            useful_inputs_by_start[start].insert(
+                candidate.boundary.boundary_inputs.begin(),
+                candidate.boundary.boundary_inputs.end());
+        }
+    }
+
+    std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash> memo;
+    (void)SolveFromState(problem, graph, candidates, useful_inputs_by_start, 0,
+                         {}, &memo);
+    return BuildSolutionFromSearch(problem, graph, candidates,
+                                   useful_inputs_by_start, memo);
+}
+
+Solution SolveWithOptimus(const Problem& problem) {
+    OptimusConfig config;
+    config.candidate_mode = GetCandidateGenerationMode();
+    config.guidance_mode = GuidanceMode::kContest;
+    return SolveWithOptimusImpl(problem, config);
+}
+
+Solution SolveWithOptimusConvGuidance(const Problem& problem) {
+    OptimusConfig config;
+    config.candidate_mode = GetCandidateGenerationMode();
+    config.guidance_mode = GuidanceMode::kConvAccelerator;
+    config.conv_guidance_variant = ConvGuidanceVariant::kAdditivePenaltyV1;
+    return SolveWithOptimusImpl(problem, config);
+}
+
+Solution SolveWithOptimusConvRerankV2(const Problem& problem) {
+    OptimusConfig config;
+    config.candidate_mode = GetCandidateGenerationMode();
+    config.guidance_mode = GuidanceMode::kConvAccelerator;
+    config.conv_guidance_variant = ConvGuidanceVariant::kLocalRerankV2;
+    return SolveWithOptimusImpl(problem, config);
+}
+
+// Paper Algorithm 1 (adapted for latency minimization):
+// - For N <= 20: bitmask DP over all precomputed candidate groups.
+//   The bitmask state tracks which ops are covered, allowing the DP to find
+//   optimal group assignments for branching DAGs that position-based DP might miss.
+//   ISValid filters are applied when building the group list.
+// - For N > 20: fall back to the existing position-based DP (also benefits
+//   from the analytical tile candidates injected into BuildBestCandidate).
+Solution SolveWithPaperOptimus(const Problem& problem) {
+    g_score_cache.clear();
+    const OpGraph graph = BuildOpGraph(problem);
+    const size_t n = graph.topo_order.size();
+
+    std::cerr << "Optimus paper: N=" << n << "\n";
+
+    OptimusConfig config;
+    config.candidate_mode = GetCandidateGenerationMode();
+    config.guidance_mode = GuidanceMode::kContest;
+
+    // Generate candidates using the standard interval approach.
+    // AddAnalyticalTileCandidates is already injected into BuildBestCandidate,
+    // so all candidates benefit from Paper Eq. 4 tile sizing.
+    std::vector<std::vector<CandidateGroup>> candidates =
+        GenerateCandidates(problem, graph, config);
+
+    if (n > 20) {
+        // Too many ops for bitmask DP (2^N states). Use positional DP fallback.
+        // Analytical tile candidates still help here.
+        std::cerr << "Optimus paper: positional DP fallback (N=" << n << ")\n";
+        const size_t num_ops = graph.topo_order.size();
+        std::vector<std::unordered_set<size_t>> useful_inputs_by_start(num_ops);
+        for (size_t start = 0; start < num_ops; ++start) {
+            for (const auto& cand : candidates[start]) {
+                useful_inputs_by_start[start].insert(
+                    cand.boundary.boundary_inputs.begin(),
+                    cand.boundary.boundary_inputs.end());
+            }
+        }
+        std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash> memo;
+        (void)SolveFromState(problem, graph, candidates, useful_inputs_by_start, 0,
+                             {}, &memo);
+        return BuildSolutionFromSearch(problem, graph, candidates,
+                                       useful_inputs_by_start, memo);
+    }
+
+    // N <= 20: build bitmask groups (with ISValid filter) and run bitmask DP.
+    std::vector<BitmaskGroup> bitmask_groups = BuildBitmaskGroups(graph, candidates);
+    std::cerr << "Optimus paper: " << bitmask_groups.size() << " bitmask groups\n";
+
+    // Ensure every op has at least a single-op fallback group.
+    {
+        std::unordered_set<int> covered_v0;
+        for (const auto& bg : bitmask_groups) {
+            covered_v0.insert(bg.v0_topo_idx);
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (!covered_v0.count(static_cast<int>(i))) {
+                // Build a single-op candidate for this op
+                CandidateGroup fallback = BuildBestCandidate(
+                    problem, graph, i, i, config);
+                if (fallback.metrics.valid) {
+                    BitmaskGroup bg;
+                    bg.mask = (1ULL << i);
+                    bg.v0_topo_idx = static_cast<int>(i);
+                    bg.candidate = std::move(fallback);
+                    bitmask_groups.push_back(std::move(bg));
+                }
+            }
+        }
+    }
+
+    // Index groups by v0_topo_idx for O(1) lookup during DP.
+    std::vector<std::vector<size_t>> groups_by_v0(n);
+    for (size_t i = 0; i < bitmask_groups.size(); ++i) {
+        int v0 = bitmask_groups[i].v0_topo_idx;
+        if (v0 >= 0 && static_cast<size_t>(v0) < n) {
+            groups_by_v0[v0].push_back(i);
+        }
+    }
+
+    const uint64_t full_mask = (n == 64u) ? ~0ULL : ((1ULL << n) - 1u);
+    std::unordered_map<uint64_t, BitmaskDecision> memo;
+    const double best_cost = SolveBitmaskDPImpl(
+        problem, graph, bitmask_groups, groups_by_v0, n, 0, full_mask, &memo);
+    std::cerr << "Optimus paper bitmask DP cost: " << best_cost << "\n";
+
+    auto schedule = RecoverBitmaskSchedule(bitmask_groups, full_mask, memo);
+
+    if (schedule.empty()) {
+        std::cerr << "Optimus paper: bitmask DP produced empty schedule, falling back\n";
+        const size_t num_ops = graph.topo_order.size();
+        std::vector<std::unordered_set<size_t>> useful_inputs_by_start(num_ops);
+        for (size_t start = 0; start < num_ops; ++start) {
+            for (const auto& cand : candidates[start]) {
+                useful_inputs_by_start[start].insert(
+                    cand.boundary.boundary_inputs.begin(),
+                    cand.boundary.boundary_inputs.end());
+            }
+        }
+        std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash> memo2;
+        (void)SolveFromState(problem, graph, candidates, useful_inputs_by_start, 0,
+                             {}, &memo2);
+        return BuildSolutionFromSearch(problem, graph, candidates,
+                                       useful_inputs_by_start, memo2);
+    }
+
+    Solution sol = BuildSolutionFromSchedule(problem, schedule);
+    if (sol.subgraphs.empty()) {
+        std::cerr << "Optimus paper: schedule build failed, falling back\n";
+        const size_t num_ops = graph.topo_order.size();
+        std::vector<std::unordered_set<size_t>> useful_inputs_by_start(num_ops);
+        for (size_t start = 0; start < num_ops; ++start) {
+            for (const auto& cand : candidates[start]) {
+                useful_inputs_by_start[start].insert(
+                    cand.boundary.boundary_inputs.begin(),
+                    cand.boundary.boundary_inputs.end());
+            }
+        }
+        std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash> memo2;
+        (void)SolveFromState(problem, graph, candidates, useful_inputs_by_start, 0,
+                             {}, &memo2);
+        return BuildSolutionFromSearch(problem, graph, candidates,
+                                       useful_inputs_by_start, memo2);
+    }
+    return sol;
 }
 
 }  // namespace mlsys
