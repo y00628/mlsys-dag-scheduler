@@ -22,6 +22,9 @@ namespace {
 enum class SolverBackend {
     kBaseline = 0,
     kOptimus,
+    kOptimusConv,
+    kOptimusConvV2,
+    kOptimusPaper,
 };
 
 struct BaselineCandidate {
@@ -287,6 +290,18 @@ SolverBackend ParseSolverBackend() {
     if (backend == "baseline" || backend == "naive") {
         return SolverBackend::kBaseline;
     }
+    if (backend == "optimus_conv" || backend == "optimus-conv" ||
+        backend == "paper") {
+        return SolverBackend::kOptimusConv;
+    }
+    if (backend == "optimus_conv_v2" || backend == "optimus-conv-v2" ||
+        backend == "paper_v2") {
+        return SolverBackend::kOptimusConvV2;
+    }
+    if (backend == "optimus_paper" || backend == "paper_optimus" ||
+        backend == "paper_new") {
+        return SolverBackend::kOptimusPaper;
+    }
     return SolverBackend::kOptimus;
 }
 
@@ -308,6 +323,21 @@ Solution Solve(const Problem& problem) {
             best = NaiveBaseline(problem);
             break;
         case SolverBackend::kOptimus:
+            std::cerr << "Solver backend: optimus\n";
+            best = SolveWithOptimus(problem);
+            break;
+        case SolverBackend::kOptimusConv:
+            std::cerr << "Solver backend: optimus_conv\n";
+            best = SolveWithOptimusConvGuidance(problem);
+            break;
+        case SolverBackend::kOptimusConvV2:
+            std::cerr << "Solver backend: optimus_conv_v2\n";
+            best = SolveWithOptimusConvRerankV2(problem);
+            break;
+        case SolverBackend::kOptimusPaper:
+            std::cerr << "Solver backend: optimus_paper\n";
+            best = SolveWithPaperOptimus(problem);
+            break;
         default:
             std::cerr << "Solver backend: optimus\n";
             best = SolveWithOptimus(problem);

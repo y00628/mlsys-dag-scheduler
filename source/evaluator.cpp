@@ -422,6 +422,199 @@ bool Contains(const std::unordered_set<size_t>& values, size_t value) {
     return values.find(value) != values.end();
 }
 
+bool EvaluateSubgraphImpl(const Problem& problem, const OpGraph& graph,
+                          const Subgraph& sg,
+                          const std::vector<size_t>& retained_inputs_vec,
+                          SubgraphEvaluation* evaluation) {
+    if (evaluation == nullptr) {
+        return false;
+    }
+    *evaluation = {};
+
+    if (sg.op_ids.empty()) {
+        return false;
+    }
+    if (sg.granularity.width <= 0 || sg.granularity.height <= 0 ||
+        sg.granularity.depth <= 0) {
+        return false;
+    }
+
+    std::unordered_set<size_t> unique_ops;
+    for (size_t op_id : sg.op_ids) {
+        if (op_id >= problem.ops.size()) {
+            return false;
+        }
+        if (!unique_ops.insert(op_id).second) {
+            return false;
+        }
+    }
+
+    std::vector<size_t> ordered_ops = TopoSortSubset(graph, sg.op_ids);
+    if (!IsConnectedSubgraph(graph, ordered_ops)) {
+        return false;
+    }
+    if (!SharesCommonOutputShape(problem, ordered_ops)) {
+        return false;
+    }
+
+    BoundaryInfo boundary = ComputeBoundaryInfo(problem, graph, ordered_ops);
+    std::unordered_set<size_t> boundary_outputs_set(boundary.boundary_outputs.begin(),
+                                                    boundary.boundary_outputs.end());
+    std::unordered_set<size_t> retained_now;
+    for (size_t tensor_id : sg.tensors_to_retain) {
+        if (!boundary_outputs_set.count(tensor_id)) {
+            return false;
+        }
+        retained_now.insert(tensor_id);
+    }
+
+    std::unordered_set<size_t> retained_prev;
+    for (size_t tensor_id : retained_inputs_vec) {
+        retained_prev.insert(tensor_id);
+    }
+
+    const auto& ref_out =
+        problem.tensors[problem.ops[ordered_ops.front()].outputs.front()];
+    const int64_t tiles_w = CeilDiv(ref_out.width, sg.granularity.width);
+    const int64_t tiles_h = CeilDiv(ref_out.height, sg.granularity.height);
+    const size_t spatial_tiles = static_cast<size_t>(tiles_w * tiles_h);
+    if (!ValidateTraversalOrder(spatial_tiles, sg.traversal_order)) {
+        return false;
+    }
+    const auto traversal = BuildTraversal(spatial_tiles, sg.traversal_order);
+
+    std::unordered_set<size_t> retained_prev_used;
+    int64_t retained_prev_bytes = 0;
+    for (size_t tensor_id : boundary.boundary_inputs) {
+        if (Contains(retained_prev, tensor_id)) {
+            retained_prev_used.insert(tensor_id);
+            retained_prev_bytes += TensorBytes(problem.tensors[tensor_id]);
+        }
+    }
+
+    int64_t max_k_steps = 1;
+    for (size_t op_id : ordered_ops) {
+        if (IsMatMul(problem.ops[op_id])) {
+            max_k_steps = std::max(max_k_steps,
+                                   CeilDiv(MatMulK(problem, op_id),
+                                           sg.granularity.depth));
+        }
+    }
+
+    std::unordered_map<SliceKey, ResidentSlice, SliceKeyHash> resident;
+    std::unordered_map<size_t, int64_t> retained_output_bytes;
+    TotalLatency subgraph_latency = 0.0;
+    int64_t logical_time = 0;
+    int64_t peak_live_bytes = retained_prev_bytes;
+
+    auto resident_total = [&resident]() {
+        int64_t total = 0;
+        for (const auto& [_, slice] : resident) {
+            total += slice.bytes;
+        }
+        return total;
+    };
+
+    for (size_t traversal_idx : traversal) {
+        const int64_t row_tile = static_cast<int64_t>(traversal_idx / tiles_w);
+        const int64_t col_tile = static_cast<int64_t>(traversal_idx % tiles_w);
+        const int64_t actual_h =
+            std::min<int64_t>(sg.granularity.height,
+                              ref_out.height - row_tile * sg.granularity.height);
+        const int64_t actual_w =
+            std::min<int64_t>(sg.granularity.width,
+                              ref_out.width - col_tile * sg.granularity.width);
+
+        for (int64_t step_index = 0; step_index < max_k_steps; ++step_index) {
+            const int64_t k_begin = step_index * sg.granularity.depth;
+            int64_t actual_k_step = 0;
+            for (size_t op_id : ordered_ops) {
+                if (!IsMatMul(problem.ops[op_id])) {
+                    continue;
+                }
+                const int64_t op_k = MatMulK(problem, op_id);
+                if (k_begin < op_k) {
+                    actual_k_step = std::max<int64_t>(
+                        actual_k_step,
+                        std::min<int64_t>(sg.granularity.depth, op_k - k_begin));
+                }
+            }
+            if (actual_k_step == 0) {
+                actual_k_step = sg.granularity.depth;
+            }
+
+            StepRequirement requirement = BuildStepRequirement(
+                problem, graph, ordered_ops, boundary, sg.granularity,
+                retained_prev_used, retained_now, row_tile, col_tile, actual_h,
+                actual_w, k_begin, actual_k_step, step_index, max_k_steps);
+
+            std::unordered_set<SliceKey, SliceKeyHash> required_now;
+            int64_t new_bytes = 0;
+            for (const auto& [key, bytes] : requirement.slices) {
+                required_now.insert(key);
+                if (!resident.count(key)) {
+                    new_bytes += bytes;
+                }
+            }
+
+            int64_t retained_output_total = 0;
+            for (const auto& [_, bytes] : retained_output_bytes) {
+                retained_output_total += bytes;
+            }
+
+            if (!EnsureCapacity(problem.fast_memory_capacity,
+                                retained_prev_bytes + retained_output_total,
+                                requirement.output_active_bytes, required_now,
+                                &resident, new_bytes)) {
+                return false;
+            }
+
+            double memory_in = 0.0;
+            for (const auto& [key, bytes] : requirement.slices) {
+                auto it = resident.find(key);
+                if (it == resident.end()) {
+                    resident[key] = ResidentSlice{bytes, ++logical_time};
+                    memory_in += static_cast<double>(bytes);
+                } else {
+                    it->second.last_used = ++logical_time;
+                }
+            }
+
+            peak_live_bytes = std::max(
+                peak_live_bytes,
+                retained_prev_bytes + retained_output_total +
+                    requirement.output_active_bytes + resident_total());
+
+            if (retained_prev_bytes + retained_output_total +
+                    requirement.output_active_bytes >
+                problem.fast_memory_capacity) {
+                return false;
+            }
+
+            const double step_latency = std::max(
+                requirement.compute_cost,
+                (memory_in + static_cast<double>(requirement.output_write_bytes)) /
+                    static_cast<double>(problem.slow_memory_bandwidth));
+            subgraph_latency += step_latency;
+
+            for (size_t tensor_id : requirement.retained_outputs_completed) {
+                retained_output_bytes[tensor_id] += actual_h * actual_w;
+            }
+        }
+    }
+
+    for (size_t tensor_id : sg.tensors_to_retain) {
+        if (retained_output_bytes[tensor_id] != TensorBytes(problem.tensors[tensor_id])) {
+            return false;
+        }
+    }
+
+    evaluation->valid = true;
+    evaluation->latency = subgraph_latency;
+    evaluation->peak_live_bytes = peak_live_bytes;
+    return true;
+}
+
 bool RecomputeImpl(const Problem& problem, const Solution& input_solution,
                    Solution* normalized_solution, TotalLatency* total_latency) {
     if (input_solution.subgraphs.empty()) {
@@ -504,136 +697,22 @@ bool RecomputeImpl(const Problem& problem, const Solution& input_solution,
             }
         }
 
-        const auto& ref_out =
-            problem.tensors[problem.ops[ordered_ops.front()].outputs.front()];
-        const int64_t tiles_w = CeilDiv(ref_out.width, sg.granularity.width);
-        const int64_t tiles_h = CeilDiv(ref_out.height, sg.granularity.height);
-        const size_t spatial_tiles = static_cast<size_t>(tiles_w * tiles_h);
-        if (!ValidateTraversalOrder(spatial_tiles, sg.traversal_order)) {
-            std::cerr << "ERROR: Subgraph " << sg_idx
-                      << " has invalid traversal order\n";
-            return false;
-        }
-        const auto traversal = BuildTraversal(spatial_tiles, sg.traversal_order);
-
-        std::unordered_set<size_t> retained_prev_used;
-        int64_t retained_prev_bytes = 0;
+        std::vector<size_t> retained_inputs_for_sg;
         for (size_t tensor_id : boundary.boundary_inputs) {
             if (Contains(retained_prev, tensor_id)) {
-                retained_prev_used.insert(tensor_id);
-                retained_prev_bytes += TensorBytes(problem.tensors[tensor_id]);
+                retained_inputs_for_sg.push_back(tensor_id);
             }
         }
 
-        int64_t max_k_steps = 1;
-        for (size_t op_id : ordered_ops) {
-            if (IsMatMul(problem.ops[op_id])) {
-                max_k_steps = std::max(max_k_steps,
-                                       CeilDiv(MatMulK(problem, op_id),
-                                               sg.granularity.depth));
-            }
+        SubgraphEvaluation subgraph_eval;
+        if (!EvaluateSubgraphImpl(problem, graph, sg, retained_inputs_for_sg,
+                                  &subgraph_eval) ||
+            !subgraph_eval.valid) {
+            std::cerr << "ERROR: Subgraph " << sg_idx
+                      << " exceeds fast memory capacity\n";
+            return false;
         }
-
-        std::unordered_map<SliceKey, ResidentSlice, SliceKeyHash> resident;
-        std::unordered_map<size_t, int64_t> retained_output_bytes;
-        TotalLatency subgraph_latency = 0.0;
-        int64_t logical_time = 0;
-
-        for (size_t traversal_idx : traversal) {
-            const int64_t row_tile = static_cast<int64_t>(traversal_idx / tiles_w);
-            const int64_t col_tile = static_cast<int64_t>(traversal_idx % tiles_w);
-            const int64_t actual_h =
-                std::min<int64_t>(sg.granularity.height,
-                                  ref_out.height - row_tile * sg.granularity.height);
-            const int64_t actual_w =
-                std::min<int64_t>(sg.granularity.width,
-                                  ref_out.width - col_tile * sg.granularity.width);
-
-            for (int64_t step_index = 0; step_index < max_k_steps; ++step_index) {
-                const int64_t k_begin = step_index * sg.granularity.depth;
-                int64_t actual_k_step = 0;
-                for (size_t op_id : ordered_ops) {
-                    if (!IsMatMul(problem.ops[op_id])) {
-                        continue;
-                    }
-                    const int64_t op_k = MatMulK(problem, op_id);
-                    if (k_begin < op_k) {
-                        actual_k_step = std::max<int64_t>(
-                            actual_k_step,
-                            std::min<int64_t>(sg.granularity.depth, op_k - k_begin));
-                    }
-                }
-                if (actual_k_step == 0) {
-                    actual_k_step = sg.granularity.depth;
-                }
-
-                StepRequirement requirement = BuildStepRequirement(
-                    problem, graph, ordered_ops, boundary, sg.granularity,
-                    retained_prev_used, retained_now, row_tile, col_tile, actual_h,
-                    actual_w, k_begin, actual_k_step, step_index, max_k_steps);
-
-                std::unordered_set<SliceKey, SliceKeyHash> required_now;
-                int64_t new_bytes = 0;
-                for (const auto& [key, bytes] : requirement.slices) {
-                    required_now.insert(key);
-                    if (!resident.count(key)) {
-                        new_bytes += bytes;
-                    }
-                }
-
-                int64_t retained_output_total = 0;
-                for (const auto& [_, bytes] : retained_output_bytes) {
-                    retained_output_total += bytes;
-                }
-
-                if (!EnsureCapacity(problem.fast_memory_capacity,
-                                    retained_prev_bytes + retained_output_total,
-                                    requirement.output_active_bytes, required_now,
-                                    &resident, new_bytes)) {
-                    std::cerr << "ERROR: Subgraph " << sg_idx
-                              << " exceeds fast memory capacity\n";
-                    return false;
-                }
-
-                double memory_in = 0.0;
-                for (const auto& [key, bytes] : requirement.slices) {
-                    auto it = resident.find(key);
-                    if (it == resident.end()) {
-                        resident[key] = ResidentSlice{bytes, ++logical_time};
-                        memory_in += static_cast<double>(bytes);
-                    } else {
-                        it->second.last_used = ++logical_time;
-                    }
-                }
-
-                if (retained_prev_bytes + retained_output_total +
-                        requirement.output_active_bytes >
-                    problem.fast_memory_capacity) {
-                    std::cerr << "ERROR: Subgraph " << sg_idx
-                              << " exceeds fast memory capacity\n";
-                    return false;
-                }
-
-                const double step_latency = std::max(
-                    requirement.compute_cost,
-                    (memory_in + static_cast<double>(requirement.output_write_bytes)) /
-                        static_cast<double>(problem.slow_memory_bandwidth));
-                subgraph_latency += step_latency;
-
-                for (size_t tensor_id : requirement.retained_outputs_completed) {
-                    retained_output_bytes[tensor_id] += actual_h * actual_w;
-                }
-            }
-        }
-
-        for (size_t tensor_id : sg.tensors_to_retain) {
-            if (retained_output_bytes[tensor_id] != TensorBytes(problem.tensors[tensor_id])) {
-                std::cerr << "ERROR: Subgraph " << sg_idx
-                          << " does not fully materialize retained tensor " << tensor_id
-                          << "\n";
-                return false;
-            }
-        }
+        const double subgraph_latency = subgraph_eval.latency;
 
         if (std::fabs(subgraph_latency - sg.subgraph_latency) > 1e-3) {
             std::cerr << "WARNING: Subgraph " << sg_idx
@@ -683,6 +762,14 @@ TotalLatency Evaluate(const Problem& problem, const Solution& solution) {
         return -1.0;
     }
     return total_latency;
+}
+
+bool EvaluateSubgraph(const Problem& problem, const Subgraph& subgraph,
+                      const std::vector<size_t>& retained_inputs,
+                      SubgraphEvaluation* evaluation) {
+    const OpGraph graph = BuildOpGraph(problem);
+    return EvaluateSubgraphImpl(problem, graph, subgraph, retained_inputs,
+                                evaluation);
 }
 
 bool RecomputeLatencies(const Problem& problem, Solution* solution,
