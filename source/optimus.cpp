@@ -238,6 +238,16 @@ struct ScoreCacheKeyHash {
     }
 };
 
+struct OpVectorHash {
+    size_t operator()(const std::vector<size_t>& ops) const {
+        size_t h = 0;
+        for (size_t op_id : ops) {
+            h ^= std::hash<size_t>{}(op_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+};
+
 constexpr double kInfinity = std::numeric_limits<double>::infinity();
 constexpr size_t kDefaultMaxGroupSize = 8;
 constexpr size_t kGranularityRefineBudget = 6;
@@ -448,6 +458,21 @@ OpGraph BuildOpGraph(const Problem& problem) {
     }
 
     return graph;
+}
+
+std::vector<size_t> CanonicalizeOpSet(const std::vector<size_t>& ops,
+                                      const OpGraph& graph) {
+    std::vector<size_t> canonical = ops;
+    std::sort(canonical.begin(), canonical.end(),
+              [&](size_t lhs, size_t rhs) {
+                  return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+              });
+    canonical.erase(std::unique(canonical.begin(), canonical.end()), canonical.end());
+    return canonical;
+}
+
+std::vector<size_t> CandidateKeyFromOps(const std::vector<size_t>& canonical_ops) {
+    return canonical_ops;
 }
 
 bool SharesCommonOutputShape(const Problem& problem,
@@ -1900,13 +1925,15 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     for (size_t topo_idx = 0; topo_idx < n; ++topo_idx) {
         const size_t seed = graph.topo_order[topo_idx];
         std::queue<std::vector<size_t>> pending;
-        std::set<std::vector<size_t>> seen;
+        std::unordered_set<std::vector<size_t>, OpVectorHash> seen;
         size_t explored_states = 0;
         size_t accepted_candidates = 0;
         size_t rejected_candidates = 0;
-        pending.push({seed});
+        const std::vector<size_t> seed_ops = CandidateKeyFromOps(
+            CanonicalizeOpSet({seed}, graph));
+        pending.push(seed_ops);
         ++global_queue_pushes;
-        seen.insert({seed});
+        seen.insert(seed_ops);
 
         while (!pending.empty()) {
             std::vector<size_t> current_ops = pending.front();
@@ -1940,12 +1967,10 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
                 }
                 std::vector<size_t> grown_ops = current_ops;
                 grown_ops.push_back(next_op);
-                std::sort(grown_ops.begin(), grown_ops.end(),
-                          [&](size_t lhs, size_t rhs) {
-                              return graph.topo_pos[lhs] < graph.topo_pos[rhs];
-                          });
-                if (seen.insert(grown_ops).second) {
-                    pending.push(grown_ops);
+                const std::vector<size_t> canonical_ops = CandidateKeyFromOps(
+                    CanonicalizeOpSet(grown_ops, graph));
+                if (seen.insert(canonical_ops).second) {
+                    pending.push(canonical_ops);
                     ++global_queue_pushes;
                 }
             }

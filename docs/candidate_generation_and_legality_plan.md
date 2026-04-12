@@ -78,14 +78,28 @@ Suggested reason codes:
 ## Phase 1 — Candidate generation upgrade (3–5 days)
 
 ### Tasks
-- [ ] Promote seed-growth to default candidate generation path
+- [x] Promote seed-growth to default candidate generation path
 - [ ] Implement expansion operators:
-  - [ ] forward successor expansion
-  - [ ] backward predecessor expansion
-  - [ ] bidirectional expansion for branch/diamond structures
+  - [x] forward successor expansion
+  - [x] backward predecessor expansion
+  - [x] bidirectional expansion for branch/diamond structures
 - [ ] Maintain boundary/internal tensor sets incrementally during growth
-- [ ] Canonicalization + de-dup key
+- [x] Canonicalization + de-dup key
 - [ ] Add dominance/rank-based pruning and hard runtime budgets
+
+### Implemented notes (current)
+- Seed-growth is now default when `MLSYS_OPTIMUS_CANDIDATES` is unset.
+- Added bidirectional frontier helper `CollectGrowthFrontier(...)` with predecessor/successor toggles.
+- Removed contiguous-topology hard gate from seed-growth acceptance path.
+- Added canonicalization/dedup helpers:
+  - `CanonicalizeOpSet(...)`
+  - `CandidateKeyFromOps(...)`
+- Replaced `std::set<std::vector<size_t>> seen` with hash-based dedup over canonical op-sets.
+- Runtime guard knobs are wired in seed-growth path:
+  - `MLSYS_OPTIMUS_SEED_MAX_GROUP`
+  - `MLSYS_OPTIMUS_SEED_MAX_FRONTIER`
+  - `MLSYS_OPTIMUS_SEED_MAX_CANDIDATES_PER_START`
+  - `MLSYS_OPTIMUS_SEED_TOTAL_QUEUE_BUDGET`
 
 ### Exit criteria
 - Non-contiguous DAG candidates are generated consistently.
@@ -97,39 +111,39 @@ Suggested reason codes:
 > Goal: make seed-growth the default/high-quality path and support more general DAG groups.
 
 #### P1-1. Seed-growth as default path
-- [ ] **Change default candidate mode** in `GetCandidateGenerationMode()`
+- [x] **Change default candidate mode** in `GetCandidateGenerationMode()`
   - from `kInterval` -> `kSeedGrowth` when env var is unset.
-- [ ] Keep interval fallback via env override (`MLSYS_OPTIMUS_CANDIDATES=interval`).
+- [x] Keep interval fallback via env override (`MLSYS_OPTIMUS_CANDIDATES=interval`).
 
 #### P1-2. Expand frontier beyond successor-only growth
-- [ ] Refactor frontier building in `GenerateSeedGrowthCandidates(...)`
+- [x] Refactor frontier building in `GenerateSeedGrowthCandidates(...)`
   - currently frontier uses only `graph.succs[op_id]`
   - add predecessor frontier (`graph.preds[op_id]`) and/or bi-direction policy.
-- [ ] Add helper function:
-  - [ ] `CollectGrowthFrontier(const OpGraph&, const std::vector<size_t>& current_ops, bool allow_predecessor_growth, bool allow_successor_growth)`
+- [x] Add helper function:
+  - [x] `CollectGrowthFrontier(const OpGraph&, const std::vector<size_t>& current_ops, bool allow_predecessor_growth, bool allow_successor_growth)`
   - output: sorted dedup candidate next ops.
 
 #### P1-3. Remove contiguous-topology gate for DAG groups
-- [ ] In `GenerateSeedGrowthCandidates(...)`, remove hard gate:
+- [x] In `GenerateSeedGrowthCandidates(...)`, remove hard gate:
   - `IsContiguousTopoSpan(graph, candidate)`
-- [ ] Replace with connectivity + legality-first gate:
+- [x] Replace with connectivity + legality-first gate:
   - retain `BuildBestCandidate(...)` validity checks
   - add/keep hard connectedness checks (`IsConnectedSubDAG(...)`).
 
 #### P1-4. Canonicalization and dedup robustness
-- [ ] Replace `std::set<std::vector<size_t>> seen` usage with canonical key helper to reduce overhead.
+- [x] Replace `std::set<std::vector<size_t>> seen` usage with canonical key helper to reduce overhead.
 - [ ] Add helper function:
-  - [ ] `CanonicalizeOpSet(const std::vector<size_t>& ops, const OpGraph& graph)`
-  - [ ] `CandidateKeyFromOps(const std::vector<size_t>& canonical_ops)`
-- [ ] Keep final dedup by `candidate.ops`, but ensure only canonicalized forms enter queue.
+  - [x] `CanonicalizeOpSet(const std::vector<size_t>& ops, const OpGraph& graph)`
+  - [x] `CandidateKeyFromOps(const std::vector<size_t>& canonical_ops)`
+- [x] Keep final dedup by `candidate.ops`, but ensure only canonicalized forms enter queue.
 
 #### P1-5. Runtime guards (hard budget knobs)
-- [ ] Add config/env knobs (read once near `GetCandidateGenerationMode()` region):
-  - [ ] `MLSYS_OPTIMUS_SEED_MAX_GROUP`
-  - [ ] `MLSYS_OPTIMUS_SEED_MAX_FRONTIER`
-  - [ ] `MLSYS_OPTIMUS_SEED_MAX_CANDIDATES_PER_START`
-  - [ ] `MLSYS_OPTIMUS_SEED_TOTAL_QUEUE_BUDGET`
-- [ ] Apply guards inside `GenerateSeedGrowthCandidates(...)`:
+- [x] Add config/env knobs (read once near `GetCandidateGenerationMode()` region):
+  - [x] `MLSYS_OPTIMUS_SEED_MAX_GROUP`
+  - [x] `MLSYS_OPTIMUS_SEED_MAX_FRONTIER`
+  - [x] `MLSYS_OPTIMUS_SEED_MAX_CANDIDATES_PER_START`
+  - [x] `MLSYS_OPTIMUS_SEED_TOTAL_QUEUE_BUDGET`
+- [x] Apply guards inside `GenerateSeedGrowthCandidates(...)`:
   - cap frontier expansion
   - cap queue growth
   - cap per-start emitted candidates.
@@ -144,9 +158,9 @@ Suggested reason codes:
   - [ ] `PassSeedPolicyFilter(const CandidateGroup&, const Problem&)`.
 
 #### P1-7. Better logging for candidate coverage debug
-- [ ] Extend `SeedDebugEnabled()` logs in `GenerateSeedGrowthCandidates(...)`:
-  - number of explored states
-  - number of accepted/rejected candidates
+- [x] Extend `SeedDebugEnabled()` logs in `GenerateSeedGrowthCandidates(...)`:
+  - [x] number of explored states
+  - [x] number of accepted/rejected candidates
   - top reject reasons (if available from legality layer later).
 
 #### P1-8. Integration checkpoint with solver path
