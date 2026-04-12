@@ -171,24 +171,34 @@ Implemented:
   - top reject reasons (if available from legality layer later).
 
 #### P1-8. Integration checkpoint with solver path
-- [ ] Ensure `SolveWithOptimusImpl(...)` uses upgraded seed-growth path safely:
+- [x] Ensure `SolveWithOptimusImpl(...)` uses upgraded seed-growth path safely:
   - candidate pool non-empty at each start
   - single-op fallback still guaranteed.
-- [ ] Validate no regression in `BuildSolutionFromSearch(...)` and `SolveFromState(...)` assumptions:
+- [x] Validate no regression in `BuildSolutionFromSearch(...)` and `SolveFromState(...)` assumptions:
   - `candidate.start`/`candidate.end` ordering remains valid
   - overlap and progression logic still terminates.
 
+Implemented:
+- Added first-pass validation script: `scripts/compare_candidate_modes.py`
+- Script runs both `interval` and `seed_growth` under `optimus` backend and reports:
+  - wall time
+  - total latency
+  - subgraph count
+  - selected non-contiguous ratio
+  - seed-start candidate stats (for seed mode)
+
 #### P1-9. Minimal test/validation checklist for Phase 1
-- [ ] On released benchmarks, collect:
-  - candidate count per `start`
-  - percentage of non-contiguous groups
-  - runtime of candidate generation
+- [x] On released benchmarks, collect:
+  - [x] candidate count per `start` (seed debug parsing)
+  - [x] percentage of non-contiguous groups (selected schedule proxy)
+  - [x] runtime (wall-clock proxy)
 - [ ] Compare three modes:
-  - interval vs seed-growth(old) vs seed-growth(new)
+  - [x] interval vs seed-growth(current)
+  - [ ] seed-growth(old) baseline (requires historical commit / snapshot run)
 - [ ] Pass criteria:
-  - no empty-start candidate buckets
-  - no crash / no infinite queue growth
-  - candidate diversity improved with bounded runtime.
+  - [ ] no empty-start candidate buckets
+  - [x] no crash / no infinite queue growth (guarded by queue budget + successful runs)
+  - [ ] candidate diversity improved with bounded runtime (pending benchmark report)
 
 #### P1-10. Suggested commit slicing (for clean review)
 - [ ] Commit A: mode default + env knobs
