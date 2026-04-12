@@ -149,13 +149,20 @@ Suggested reason codes:
   - cap per-start emitted candidates.
 
 #### P1-6. Quality filtering as policy layer (not hard legality)
-- [ ] Keep hard validity in `BuildBestCandidate(...)`:
+- [x] Keep hard validity in `BuildBestCandidate(...)`:
   - `SharesCommonOutputShape(...)`, `IsConnectedSubDAG(...)`, scorer-valid metrics.
-- [ ] Move aggressive candidate suppression to policy phase in `GenerateSeedGrowthCandidates(...)`:
+- [x] Move aggressive candidate suppression to policy phase in `GenerateSeedGrowthCandidates(...)`:
   - internalized-bytes threshold
   - density ranking/truncation (currently top-8).
-- [ ] Add a policy helper function:
-  - [ ] `PassSeedPolicyFilter(const CandidateGroup&, const Problem&)`.
+- [x] Add a policy helper function:
+  - [x] `PassSeedPolicyFilter(const CandidateGroup&, const Problem&)`.
+
+Implemented:
+- Added `PassSeedPolicyFilter(...)` and extracted internalized-threshold suppression out of core growth logic.
+- Added `RankAndTrimSeedCandidates(...)` to centralize policy ranking + truncation.
+- Added policy env knobs:
+  - `MLSYS_OPTIMUS_SEED_POLICY_ENFORCE_INTERNALIZED`
+  - `MLSYS_OPTIMUS_SEED_POLICY_MIN_INTERNALIZED`
 
 #### P1-7. Better logging for candidate coverage debug
 - [x] Extend `SeedDebugEnabled()` logs in `GenerateSeedGrowthCandidates(...)`:

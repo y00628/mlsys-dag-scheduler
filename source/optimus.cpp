@@ -284,6 +284,19 @@ int64_t TensorBytesForSet(const Problem& problem,
     return total;
 }
 
+int64_t ReadInt64EnvOrDefault(const char* name, int64_t default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    char* end = nullptr;
+    const long long parsed = std::strtoll(raw, &end, 10);
+    if (end == raw) {
+        return default_value;
+    }
+    return static_cast<int64_t>(parsed);
+}
+
 int64_t MatMulK(const Problem& problem, size_t op_id) {
     const auto& op = problem.ops[op_id];
     if (op.inputs.size() < 2) {
@@ -1907,6 +1920,66 @@ std::vector<size_t> CollectGrowthFrontier(
     return frontier;
 }
 
+bool PassSeedPolicyFilter(const CandidateGroup& candidate,
+                          const Problem& problem) {
+    if (candidate.ops.size() <= 1) {
+        return true;
+    }
+
+    const bool enforce_internalized_threshold = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_SEED_POLICY_ENFORCE_INTERNALIZED", true);
+    if (!enforce_internalized_threshold) {
+        return true;
+    }
+
+    const int64_t default_min_internalized =
+        std::max<int64_t>(1, problem.native_granularity.width) *
+        std::max<int64_t>(1, problem.native_granularity.height);
+    const int64_t min_internalized = std::max<int64_t>(
+        0, ReadInt64EnvOrDefault("MLSYS_OPTIMUS_SEED_POLICY_MIN_INTERNALIZED",
+                                 default_min_internalized));
+    return candidate.internalized_bytes >= min_internalized;
+}
+
+void RankAndTrimSeedCandidates(std::vector<CandidateGroup>* candidates,
+                               size_t max_candidates) {
+    if (candidates == nullptr) {
+        return;
+    }
+
+    std::sort(candidates->begin(), candidates->end(),
+              [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                  if (lhs.ops == rhs.ops) {
+                      return lhs.metrics.latency < rhs.metrics.latency;
+                  }
+                  return lhs.ops < rhs.ops;
+              });
+    candidates->erase(
+        std::unique(candidates->begin(), candidates->end(),
+                    [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                        return lhs.ops == rhs.ops;
+                    }),
+        candidates->end());
+
+    std::sort(candidates->begin(), candidates->end(),
+              [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                  const double lhs_solo = static_cast<double>(lhs.ops.size());
+                  const double rhs_solo = static_cast<double>(rhs.ops.size());
+                  const double lhs_density = lhs.internalized_bytes -
+                                             lhs.metrics.latency / lhs_solo;
+                  const double rhs_density = rhs.internalized_bytes -
+                                             rhs.metrics.latency / rhs_solo;
+                  if (lhs_density != rhs_density) {
+                      return lhs_density > rhs_density;
+                  }
+                  return lhs.metrics.latency < rhs.metrics.latency;
+              });
+
+    if (candidates->size() > max_candidates) {
+        candidates->resize(max_candidates);
+    }
+}
+
 std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
     const size_t n = graph.topo_order.size();
@@ -1943,11 +2016,11 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
             CandidateGroup candidate =
                 BuildBestCandidate(problem, graph, current_ops, config);
             if (candidate.metrics.valid) {
-                if (candidate.ops.size() == 1 || candidate.internalized_bytes >=
-                        std::max<int64_t>(1, problem.native_granularity.width) *
-                            std::max<int64_t>(1, problem.native_granularity.height)) {
+                if (PassSeedPolicyFilter(candidate, problem)) {
                     by_start[candidate.start].push_back(candidate);
                     ++accepted_candidates;
+                } else {
+                    ++rejected_candidates;
                 }
             } else {
                 ++rejected_candidates;
@@ -1983,36 +2056,7 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
 
     for (size_t start = 0; start < n; ++start) {
         auto& candidates = by_start[start];
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
-                      if (lhs.ops == rhs.ops) {
-                          return lhs.metrics.latency < rhs.metrics.latency;
-                      }
-                      return lhs.ops < rhs.ops;
-                  });
-        candidates.erase(
-            std::unique(candidates.begin(), candidates.end(),
-                        [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
-                            return lhs.ops == rhs.ops;
-                        }),
-            candidates.end());
-
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
-                      const double lhs_solo = static_cast<double>(lhs.ops.size());
-                      const double rhs_solo = static_cast<double>(rhs.ops.size());
-                      const double lhs_density = lhs.internalized_bytes -
-                                                 lhs.metrics.latency / lhs_solo;
-                      const double rhs_density = rhs.internalized_bytes -
-                                                 rhs.metrics.latency / rhs_solo;
-                      if (lhs_density != rhs_density) {
-                          return lhs_density > rhs_density;
-                      }
-                      return lhs.metrics.latency < rhs.metrics.latency;
-                  });
-        if (candidates.size() > runtime.max_candidates_per_start) {
-            candidates.resize(runtime.max_candidates_per_start);
-        }
+        RankAndTrimSeedCandidates(&candidates, runtime.max_candidates_per_start);
 
         if (candidates.empty()) {
             CandidateGroup fallback =
