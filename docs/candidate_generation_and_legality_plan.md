@@ -80,6 +80,91 @@ Suggested reason codes:
 - Non-contiguous DAG candidates are generated consistently.
 - Candidate count is bounded by guard rails on all released benchmarks.
 
+### Phase 1 implementation task list (function-level)
+
+> Target file: `source/optimus.cpp`  
+> Goal: make seed-growth the default/high-quality path and support more general DAG groups.
+
+#### P1-1. Seed-growth as default path
+- [ ] **Change default candidate mode** in `GetCandidateGenerationMode()`
+  - from `kInterval` -> `kSeedGrowth` when env var is unset.
+- [ ] Keep interval fallback via env override (`MLSYS_OPTIMUS_CANDIDATES=interval`).
+
+#### P1-2. Expand frontier beyond successor-only growth
+- [ ] Refactor frontier building in `GenerateSeedGrowthCandidates(...)`
+  - currently frontier uses only `graph.succs[op_id]`
+  - add predecessor frontier (`graph.preds[op_id]`) and/or bi-direction policy.
+- [ ] Add helper function:
+  - [ ] `CollectGrowthFrontier(const OpGraph&, const std::vector<size_t>& current_ops, bool allow_predecessor_growth, bool allow_successor_growth)`
+  - output: sorted dedup candidate next ops.
+
+#### P1-3. Remove contiguous-topology gate for DAG groups
+- [ ] In `GenerateSeedGrowthCandidates(...)`, remove hard gate:
+  - `IsContiguousTopoSpan(graph, candidate)`
+- [ ] Replace with connectivity + legality-first gate:
+  - retain `BuildBestCandidate(...)` validity checks
+  - add/keep hard connectedness checks (`IsConnectedSubDAG(...)`).
+
+#### P1-4. Canonicalization and dedup robustness
+- [ ] Replace `std::set<std::vector<size_t>> seen` usage with canonical key helper to reduce overhead.
+- [ ] Add helper function:
+  - [ ] `CanonicalizeOpSet(const std::vector<size_t>& ops, const OpGraph& graph)`
+  - [ ] `CandidateKeyFromOps(const std::vector<size_t>& canonical_ops)`
+- [ ] Keep final dedup by `candidate.ops`, but ensure only canonicalized forms enter queue.
+
+#### P1-5. Runtime guards (hard budget knobs)
+- [ ] Add config/env knobs (read once near `GetCandidateGenerationMode()` region):
+  - [ ] `MLSYS_OPTIMUS_SEED_MAX_GROUP`
+  - [ ] `MLSYS_OPTIMUS_SEED_MAX_FRONTIER`
+  - [ ] `MLSYS_OPTIMUS_SEED_MAX_CANDIDATES_PER_START`
+  - [ ] `MLSYS_OPTIMUS_SEED_TOTAL_QUEUE_BUDGET`
+- [ ] Apply guards inside `GenerateSeedGrowthCandidates(...)`:
+  - cap frontier expansion
+  - cap queue growth
+  - cap per-start emitted candidates.
+
+#### P1-6. Quality filtering as policy layer (not hard legality)
+- [ ] Keep hard validity in `BuildBestCandidate(...)`:
+  - `SharesCommonOutputShape(...)`, `IsConnectedSubDAG(...)`, scorer-valid metrics.
+- [ ] Move aggressive candidate suppression to policy phase in `GenerateSeedGrowthCandidates(...)`:
+  - internalized-bytes threshold
+  - density ranking/truncation (currently top-8).
+- [ ] Add a policy helper function:
+  - [ ] `PassSeedPolicyFilter(const CandidateGroup&, const Problem&)`.
+
+#### P1-7. Better logging for candidate coverage debug
+- [ ] Extend `SeedDebugEnabled()` logs in `GenerateSeedGrowthCandidates(...)`:
+  - number of explored states
+  - number of accepted/rejected candidates
+  - top reject reasons (if available from legality layer later).
+
+#### P1-8. Integration checkpoint with solver path
+- [ ] Ensure `SolveWithOptimusImpl(...)` uses upgraded seed-growth path safely:
+  - candidate pool non-empty at each start
+  - single-op fallback still guaranteed.
+- [ ] Validate no regression in `BuildSolutionFromSearch(...)` and `SolveFromState(...)` assumptions:
+  - `candidate.start`/`candidate.end` ordering remains valid
+  - overlap and progression logic still terminates.
+
+#### P1-9. Minimal test/validation checklist for Phase 1
+- [ ] On released benchmarks, collect:
+  - candidate count per `start`
+  - percentage of non-contiguous groups
+  - runtime of candidate generation
+- [ ] Compare three modes:
+  - interval vs seed-growth(old) vs seed-growth(new)
+- [ ] Pass criteria:
+  - no empty-start candidate buckets
+  - no crash / no infinite queue growth
+  - candidate diversity improved with bounded runtime.
+
+#### P1-10. Suggested commit slicing (for clean review)
+- [ ] Commit A: mode default + env knobs
+- [ ] Commit B: frontier refactor + bidirectional growth
+- [ ] Commit C: contiguous gate removal + canonical dedup
+- [ ] Commit D: runtime guards + policy filter helper
+- [ ] Commit E: debug metrics + benchmark comparison notes
+
 ---
 
 ## Phase 2 — Legality checker refactor (3–5 days)
