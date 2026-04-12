@@ -55,9 +55,20 @@ Suggested reason codes:
 ## Phase 0 — Contract freeze (1–2 days)
 
 ### Tasks
-- [ ] Finalize `GroupCandidate` and `LegalityResult` fields
-- [ ] Define legality levels and reason code dictionary
-- [ ] Define runtime guard knobs (frontier budget, max group size, candidate budget)
+- [x] Finalize `GroupCandidate` and `LegalityResult` fields
+- [x] Define legality levels and reason code dictionary
+- [x] Define runtime guard knobs (frontier budget, max group size, candidate budget)
+
+### Implemented notes
+- Added `LegalityLevel`, `LegalityReason`, `LegalityResult` in `source/optimus.cpp`.
+- Extended `CandidateGroup` with phase-0 contract fields:
+  - `seed_id`, `growth_depth`, `topo_footprint`, `legality`, `debug_tags`.
+- Added reason-code string helpers for debugging/reporting.
+- Added seed-growth runtime guard config parsing from env:
+  - `MLSYS_OPTIMUS_SEED_MAX_GROUP`
+  - `MLSYS_OPTIMUS_SEED_MAX_FRONTIER`
+  - `MLSYS_OPTIMUS_SEED_MAX_CANDIDATES_PER_START`
+  - `MLSYS_OPTIMUS_SEED_TOTAL_QUEUE_BUDGET`
 
 ### Exit criteria
 - All downstream modules can consume schema without private assumptions.
