@@ -10,5 +10,6 @@ Solution SolveWithOptimus(const Problem& problem);
 Solution SolveWithOptimusConvGuidance(const Problem& problem);
 Solution SolveWithOptimusConvRerankV2(const Problem& problem);
 Solution SolveWithPaperOptimus(const Problem& problem);
+Solution SolveWithOptimusSched(const Problem& problem);
 
 }  // namespace mlsys
