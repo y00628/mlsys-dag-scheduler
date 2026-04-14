@@ -25,6 +25,7 @@ enum class SolverBackend {
     kOptimusConv,
     kOptimusConvV2,
     kOptimusPaper,
+    kOptimusSched,
 };
 
 struct BaselineCandidate {
@@ -302,6 +303,10 @@ SolverBackend ParseSolverBackend() {
         backend == "paper_new") {
         return SolverBackend::kOptimusPaper;
     }
+    if (backend == "optimus_sched" || backend == "optimus-sched" ||
+        backend == "sched") {
+        return SolverBackend::kOptimusSched;
+    }
     return SolverBackend::kOptimus;
 }
 
@@ -337,6 +342,10 @@ Solution Solve(const Problem& problem) {
         case SolverBackend::kOptimusPaper:
             std::cerr << "Solver backend: optimus_paper\n";
             best = SolveWithPaperOptimus(problem);
+            break;
+        case SolverBackend::kOptimusSched:
+            std::cerr << "Solver backend: optimus_sched\n";
+            best = SolveWithOptimusSched(problem);
             break;
         default:
             std::cerr << "Solver backend: optimus\n";

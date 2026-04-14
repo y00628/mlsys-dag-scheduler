@@ -50,6 +50,17 @@ struct StepEstimate {
     double compute_cost = 0.0;
 };
 
+// Scheduler-driven analysis result stored per candidate.
+struct SchedulerEstimate {
+    bool valid = false;
+    bool is_linear_chain = false;
+    int64_t subgroup_count = 0;
+    int64_t parameter_refills = 0;
+    double estimated_memory_traffic_bytes = 0.0;
+    double scheduler_latency_estimate = std::numeric_limits<double>::infinity();
+    double confidence = 0.0;  // [0,1], lower for non-linear fallback
+};
+
 struct CandidateGroup {
     size_t start = 0;
     size_t end = 0;
@@ -58,6 +69,7 @@ struct CandidateGroup {
     Granularity granularity{};
     GroupMetrics metrics;
     int64_t internalized_bytes = 0;
+    SchedulerEstimate scheduler;  // Scheduler analysis (optional, default invalid)
 };
 
 enum class CandidateGenerationMode {
@@ -80,6 +92,9 @@ struct OptimusConfig {
     GuidanceMode guidance_mode = GuidanceMode::kContest;
     ConvGuidanceVariant conv_guidance_variant =
         ConvGuidanceVariant::kAdditivePenaltyV1;
+    // Scheduler integration settings
+    double scheduler_cost_weight = 0.0;       // Blended cost: (1-w)*evaluator + w*scheduler
+    bool scheduler_propose_granularity = false; // Inject scheduler-proposed granularities
 };
 
 struct ConvGuidanceMetrics {
@@ -527,6 +542,408 @@ ConvGuidanceMetrics AnalyzeConvGuidance(const Problem& problem, const OpGraph& g
         static_cast<double>(estimate.parameter_refills) * 0.25 +
         static_cast<double>(std::max<int64_t>(0, estimate.subgroup_count - 1)) * 8.0;
     return metrics;
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler-driven analysis and granularity proposal (optimus_sched backend)
+// ---------------------------------------------------------------------------
+
+// Forward declaration for EstimateProxyLatency (defined later, used as fallback).
+double EstimateProxyLatency(const Problem& problem, const OpGraph& graph,
+                            const std::vector<size_t>& ops,
+                            const GroupBoundary& boundary,
+                            const Granularity& granularity);
+
+// Reuse-aware analytical latency model.  O(k_steps) complexity.
+// Models LHS reuse across column tiles, RHS reuse across row tiles,
+// and gates on capacity (falls back to proxy when reuse set too large).
+struct ReuseAwareEstimate {
+    bool reuse_possible = false;
+    double latency = std::numeric_limits<double>::infinity();
+    double effective_traffic_bytes = 0.0;
+    int64_t reuse_set_bytes = 0;
+};
+
+ReuseAwareEstimate EstimateSchedulerLatency(
+    const Problem& problem, const OpGraph& graph,
+    const std::vector<size_t>& ops, const GroupBoundary& boundary,
+    const Granularity& granularity) {
+
+    ReuseAwareEstimate result;
+    if (ops.empty()) {
+        return result;
+    }
+
+    const auto& ref_out =
+        problem.tensors[problem.ops[ops.front()].outputs.front()];
+    const int64_t tiles_w = CeilDivInt(ref_out.width, granularity.width);
+    const int64_t tiles_h = CeilDivInt(ref_out.height, granularity.height);
+    const int64_t actual_h =
+        std::min<int64_t>(granularity.height, ref_out.height);
+    const int64_t actual_w =
+        std::min<int64_t>(granularity.width, ref_out.width);
+
+    int64_t max_k_steps = 1;
+    for (size_t op_id : ops) {
+        if (IsMatMul(problem.ops[op_id])) {
+            max_k_steps = std::max(
+                max_k_steps,
+                CeilDivInt(MatMulK(problem, op_id), granularity.depth));
+        }
+    }
+
+    std::unordered_set<size_t> op_set(ops.begin(), ops.end());
+    std::unordered_set<size_t> boundary_outputs(
+        boundary.boundary_outputs.begin(), boundary.boundary_outputs.end());
+
+    // 1. Compute reuse set — worst case bytes simultaneously resident when
+    //    processing one row of tiles (row-major traversal assumed).
+    //    LHS stays for the whole row; RHS is reloaded per row but stays across
+    //    columns within a row only if it fits.
+    int64_t reuse_set_bytes = 0;
+    for (size_t op_id : ops) {
+        const auto& op = problem.ops[op_id];
+        if (IsMatMul(op)) {
+            // LHS tile for one k-step: h * k
+            if (!op.inputs.empty()) {
+                int p = graph.producer_of_tensor[op.inputs[0]];
+                if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                    reuse_set_bytes += actual_h * granularity.depth;
+                }
+            }
+            // RHS tile for one k-step: w * k  (per column tile)
+            if (op.inputs.size() >= 2) {
+                int p = graph.producer_of_tensor[op.inputs[1]];
+                if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                    reuse_set_bytes += actual_w * granularity.depth;
+                }
+            }
+            // Output accumulator tile: h * w
+            reuse_set_bytes += actual_h * actual_w;
+        } else if (IsPointwise(op)) {
+            for (size_t tensor_id : op.inputs) {
+                int p = graph.producer_of_tensor[tensor_id];
+                if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                    reuse_set_bytes += actual_h * actual_w;
+                }
+            }
+            if (boundary_outputs.count(op.outputs.front())) {
+                reuse_set_bytes += actual_h * actual_w;
+            }
+        }
+    }
+    result.reuse_set_bytes = reuse_set_bytes;
+
+    // 2. Capacity gate: if reuse set doesn't fit, fall back to proxy.
+    if (reuse_set_bytes > problem.fast_memory_capacity) {
+        result.reuse_possible = false;
+        result.latency =
+            EstimateProxyLatency(problem, graph, ops, boundary, granularity);
+        result.effective_traffic_bytes =
+            result.latency *
+            static_cast<double>(problem.slow_memory_bandwidth);
+        return result;
+    }
+
+    result.reuse_possible = true;
+
+    // 3. Compute reuse-aware per-step latency.
+    const int64_t native_w =
+        std::max<int64_t>(1, problem.native_granularity.width);
+    const int64_t native_h =
+        std::max<int64_t>(1, problem.native_granularity.height);
+    const int64_t native_k =
+        std::max<int64_t>(1, problem.native_granularity.depth);
+    const double spatial_factor = static_cast<double>(
+        CeilDivInt(granularity.width, native_w) *
+        CeilDivInt(granularity.height, native_h));
+    const double bw =
+        std::max<double>(1.0, static_cast<double>(problem.slow_memory_bandwidth));
+
+    double total_latency = 0.0;
+    double total_traffic = 0.0;
+
+    for (int64_t step_index = 0; step_index < max_k_steps; ++step_index) {
+        const bool final_k_step = (step_index == max_k_steps - 1);
+        const int64_t k_begin = step_index * granularity.depth;
+
+        double compute_cost = 0.0;
+        double memory_bytes = 0.0;
+
+        for (size_t op_id : ops) {
+            const auto& op = problem.ops[op_id];
+
+            if (IsMatMul(op)) {
+                const int64_t k_total = MatMulK(problem, op_id);
+                if (k_begin >= k_total) continue;
+
+                const int64_t actual_k_step =
+                    std::min<int64_t>(granularity.depth, k_total - k_begin);
+
+                // Compute cost (same formula as EstimateStep).
+                compute_cost +=
+                    static_cast<double>(op.base_cost) * spatial_factor *
+                    (static_cast<double>(actual_k_step) /
+                     static_cast<double>(native_k));
+
+                // LHS (activation): h × k_step, reused across column tiles.
+                // Amortized: load once per row of tiles → divide by tiles_w.
+                if (!op.inputs.empty()) {
+                    int p = graph.producer_of_tensor[op.inputs[0]];
+                    if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                        memory_bytes += static_cast<double>(
+                                            actual_h * actual_k_step) /
+                                        static_cast<double>(tiles_w);
+                    }
+                }
+                // RHS (weight): w × k_step, reused across row tiles.
+                // Amortized: load once per column of tiles → divide by tiles_h.
+                if (op.inputs.size() >= 2) {
+                    int p = graph.producer_of_tensor[op.inputs[1]];
+                    if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                        memory_bytes += static_cast<double>(
+                                            actual_w * actual_k_step) /
+                                        static_cast<double>(tiles_h);
+                    }
+                }
+                // Output: stays in fast memory across k-steps, written once.
+                if (final_k_step &&
+                    boundary_outputs.count(op.outputs.front())) {
+                    memory_bytes += actual_h * actual_w;
+                }
+            } else if (IsPointwise(op) && final_k_step) {
+                compute_cost +=
+                    static_cast<double>(op.base_cost) * spatial_factor;
+
+                // Pointwise boundary inputs: loaded per tile, no spatial reuse.
+                for (size_t tensor_id : op.inputs) {
+                    int p = graph.producer_of_tensor[tensor_id];
+                    if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
+                        memory_bytes += actual_h * actual_w;
+                    }
+                }
+                // Output.
+                if (boundary_outputs.count(op.outputs.front())) {
+                    memory_bytes += actual_h * actual_w;
+                }
+            }
+        }
+
+        const double memory_time = memory_bytes / bw;
+        total_latency += std::max(compute_cost, memory_time);
+        total_traffic += memory_bytes;
+    }
+
+    result.latency =
+        total_latency * static_cast<double>(tiles_h * tiles_w);
+    result.effective_traffic_bytes =
+        total_traffic * static_cast<double>(tiles_h * tiles_w);
+    return result;
+}
+
+SchedulerEstimate RunSchedulerAnalysis(const Problem& problem, const OpGraph& graph,
+                                       const std::vector<size_t>& ops,
+                                       const GroupBoundary& boundary,
+                                       const Granularity& granularity) {
+    SchedulerEstimate estimate;
+    estimate.is_linear_chain = IsLinearChainCandidate(graph, ops);
+
+    // Run the reuse-aware analytical latency model.
+    const ReuseAwareEstimate reuse_est =
+        EstimateSchedulerLatency(problem, graph, ops, boundary, granularity);
+
+    if (estimate.is_linear_chain) {
+        // Also run conv-accelerator analysis for subgroup/refill metadata.
+        std::vector<Conv2DOp> conv_ops;
+        conv_ops.reserve(ops.size());
+        for (size_t op_id : ops) {
+            conv_ops.push_back(BuildPseudoConvOp(problem, op_id));
+        }
+
+        const ConvAcceleratorSpec spec = BuildConvAcceleratorSpec(problem);
+        const ConvTileShape terminal_tile =
+            BuildPseudoConvTerminalTile(problem, ops, granularity);
+        const ConvGroupScheduleEstimate conv_est =
+            AnalyzeConvChain(conv_ops, spec, terminal_tile);
+
+        if (conv_est.valid) {
+            estimate.valid = true;
+            estimate.subgroup_count = conv_est.subgroup_count;
+            estimate.parameter_refills = conv_est.parameter_refills;
+            estimate.estimated_memory_traffic_bytes =
+                reuse_est.effective_traffic_bytes;
+            estimate.scheduler_latency_estimate = reuse_est.latency;
+
+            // Confidence: higher when reuse is possible.
+            double confidence = reuse_est.reuse_possible ? 0.9 : 0.5;
+            if (conv_est.subgroup_count > 4) confidence *= 0.85;
+            if (conv_est.subgroup_count > 16) confidence *= 0.75;
+            if (conv_est.parameter_refills > static_cast<int64_t>(ops.size())) {
+                confidence *= 0.9;
+            }
+            estimate.confidence = std::max(0.1, std::min(1.0, confidence));
+        } else {
+            // Conv analysis failed but we still have the reuse estimate.
+            estimate.valid = true;
+            estimate.subgroup_count = 1;
+            estimate.parameter_refills = 1;
+            estimate.estimated_memory_traffic_bytes =
+                reuse_est.effective_traffic_bytes;
+            estimate.scheduler_latency_estimate = reuse_est.latency;
+            estimate.confidence = reuse_est.reuse_possible ? 0.6 : 0.3;
+        }
+    } else {
+        // Non-linear groups: reuse-aware estimate with lower confidence.
+        estimate.valid = true;
+        estimate.estimated_memory_traffic_bytes =
+            reuse_est.effective_traffic_bytes;
+        estimate.scheduler_latency_estimate = reuse_est.latency;
+        estimate.subgroup_count = 1;
+        estimate.parameter_refills = 1;
+        estimate.confidence = reuse_est.reuse_possible ? 0.4 : 0.15;
+    }
+
+    return estimate;
+}
+
+// Forward declarations needed by ProposeSchedulerGranularity.
+int64_t EstimateWorkingSetBytes(const Problem& problem, const OpGraph& graph,
+                                const std::vector<size_t>& ops,
+                                const GroupBoundary& boundary,
+                                const Granularity& granularity);
+double EstimateProxyLatency(const Problem& problem, const OpGraph& graph,
+                            const std::vector<size_t>& ops,
+                            const GroupBoundary& boundary,
+                            const Granularity& granularity);
+std::vector<int64_t> BuildKCandidates(const Problem& problem,
+                                       const std::vector<size_t>& ops);
+struct TileBufferCoeffs {
+    double area_coeff = 0.0;
+    double row_coeff  = 0.0;
+    double col_coeff  = 0.0;
+};
+TileBufferCoeffs ComputeBufferCoeffs(const Problem& problem,
+                                      const OpGraph& graph,
+                                      const std::vector<size_t>& ops,
+                                      const GroupBoundary& boundary);
+int64_t SolveQuadraticTileWidth(double A_r, double B, double C);
+
+std::vector<Granularity> ProposeSchedulerGranularity(
+    const Problem& problem, const OpGraph& graph,
+    const std::vector<size_t>& ops, const GroupBoundary& boundary,
+    size_t max_proposals = 4) {
+
+    std::vector<Granularity> proposals;
+    if (!IsLinearChainCandidate(graph, ops)) {
+        return proposals;  // Only propose for linear chains.
+    }
+
+    // Build pseudo-conv representation.
+    std::vector<Conv2DOp> conv_ops;
+    conv_ops.reserve(ops.size());
+    for (size_t op_id : ops) {
+        conv_ops.push_back(BuildPseudoConvOp(problem, op_id));
+    }
+    const ConvAcceleratorSpec spec = BuildConvAcceleratorSpec(problem);
+
+    const auto& ref_out =
+        problem.tensors[problem.ops[ops.front()].outputs.front()];
+    const int64_t out_h = std::max<int64_t>(1, ref_out.height);
+    const int64_t out_w = std::max<int64_t>(1, ref_out.width);
+    const double C = static_cast<double>(problem.fast_memory_capacity);
+
+    const auto k_candidates = BuildKCandidates(problem, ops);
+
+    // Aspect ratios to try: natural, square, inverse.
+    std::vector<double> ratios;
+    ratios.push_back(static_cast<double>(out_h) / static_cast<double>(out_w));
+    if (out_h != out_w) {
+        ratios.push_back(1.0);
+    }
+    ratios.push_back(static_cast<double>(out_w) / static_cast<double>(out_h));
+
+    // Use the analytical quadratic solve to find max tile, then validate with
+    // the scheduler (AnalyzeConvChain) rather than just the proxy.
+    const TileBufferCoeffs coeffs =
+        ComputeBufferCoeffs(problem, graph, ops, boundary);
+
+    struct ProposalWithScore {
+        Granularity g;
+        double traffic;
+    };
+    std::vector<ProposalWithScore> scored;
+
+    for (int64_t k_step : k_candidates) {
+        if (k_step <= 0) continue;
+        for (double r : ratios) {
+            if (r <= 0.0) continue;
+
+            const double A_r = coeffs.area_coeff * r;
+            const double B = (coeffs.row_coeff * r + coeffs.col_coeff) *
+                             static_cast<double>(k_step);
+            int64_t max_tw = SolveQuadraticTileWidth(A_r, B, C);
+            if (max_tw <= 0) continue;
+
+            int64_t tile_w = std::min<int64_t>(out_w, max_tw);
+            int64_t tile_h = std::min<int64_t>(
+                out_h,
+                static_cast<int64_t>(r * static_cast<double>(tile_w)));
+            tile_h = std::max<int64_t>(1, tile_h);
+            tile_w = std::max<int64_t>(1, tile_w);
+
+            Granularity g{tile_w, tile_h, k_step};
+
+            // Validate with scheduler (conv chain analysis).
+            ConvTileShape terminal_tile =
+                BuildPseudoConvTerminalTile(problem, ops, g);
+            ConvGroupScheduleEstimate est =
+                AnalyzeConvChain(conv_ops, spec, terminal_tile);
+            if (!est.valid ||
+                est.working_set.total_bytes > problem.fast_memory_capacity) {
+                // Try halving.
+                tile_w = std::max<int64_t>(1, tile_w / 2);
+                tile_h = std::max<int64_t>(1, tile_h / 2);
+                g = {tile_w, tile_h, k_step};
+                terminal_tile = BuildPseudoConvTerminalTile(problem, ops, g);
+                est = AnalyzeConvChain(conv_ops, spec, terminal_tile);
+                if (!est.valid ||
+                    est.working_set.total_bytes > problem.fast_memory_capacity) {
+                    continue;
+                }
+            }
+
+            scored.push_back({g, est.estimated_memory_traffic_bytes});
+        }
+    }
+
+    // Sort by traffic (lower is better).
+    std::sort(scored.begin(), scored.end(),
+              [](const ProposalWithScore& a, const ProposalWithScore& b) {
+                  return a.traffic < b.traffic;
+              });
+
+    // Deduplicate and take top max_proposals.
+    std::set<std::tuple<int64_t, int64_t, int64_t>> seen;
+    for (const auto& p : scored) {
+        auto key = std::make_tuple(p.g.width, p.g.height, p.g.depth);
+        if (seen.insert(key).second) {
+            proposals.push_back(p.g);
+            if (proposals.size() >= max_proposals) break;
+        }
+    }
+
+    return proposals;
+}
+
+double ComputeBlendedCost(double evaluator_latency,
+                          const SchedulerEstimate& scheduler,
+                          double weight) {
+    if (!scheduler.valid || weight <= 0.0) {
+        return evaluator_latency;
+    }
+    const double effective_weight = weight * scheduler.confidence;
+    return (1.0 - effective_weight) * evaluator_latency +
+           effective_weight * scheduler.scheduler_latency_estimate;
 }
 
 bool ShouldApplyConvGuidanceV2(const Problem& problem, const OpGraph& graph,
@@ -1028,6 +1445,174 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
     return BuildBestCandidate(problem, graph, ops, config);
 }
 
+// ---------------------------------------------------------------------------
+// Scheduler-extended candidate builder.  Delegates to BuildBestCandidate for
+// the base logic, then optionally injects scheduler-proposed granularities and
+// attaches a SchedulerEstimate to the winning candidate.
+// ---------------------------------------------------------------------------
+CandidateGroup BuildBestCandidateWithScheduler(
+    const Problem& problem, const OpGraph& graph,
+    const std::vector<size_t>& input_ops,
+    const OptimusConfig& config) {
+
+    CandidateGroup candidate;
+    candidate.ops = input_ops;
+    std::sort(candidate.ops.begin(), candidate.ops.end(),
+              [&](size_t lhs, size_t rhs) {
+                  return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+              });
+    if (candidate.ops.empty()) {
+        return candidate;
+    }
+    candidate.start = graph.topo_pos[candidate.ops.front()];
+    candidate.end = graph.topo_pos[candidate.ops.back()];
+
+    if (!SharesCommonOutputShape(problem, candidate.ops)) {
+        return candidate;
+    }
+    if (!IsConnectedSubDAG(graph, candidate.ops)) {
+        return candidate;
+    }
+
+    candidate.boundary = ComputeBoundary(problem, graph, candidate.ops);
+    for (size_t tensor_id : candidate.boundary.internal_tensors) {
+        candidate.internalized_bytes += TensorElements(problem.tensors[tensor_id]);
+    }
+    if (candidate.ops.size() > 1 && candidate.boundary.internal_tensors.empty()) {
+        return candidate;
+    }
+
+    // --- Granularity enumeration (same as BuildBestCandidate) ----------------
+    const auto& ref_out =
+        problem.tensors[problem.ops[candidate.ops.front()].outputs.front()];
+    const auto width_candidates =
+        BuildSpatialCandidates(ref_out.width, problem.native_granularity.width);
+    const auto height_candidates =
+        BuildSpatialCandidates(ref_out.height, problem.native_granularity.height);
+    const auto k_candidates = BuildKCandidates(problem, candidate.ops);
+    std::vector<std::pair<double, Granularity>> proxy_ranked;
+
+    for (int64_t width : width_candidates) {
+        for (int64_t height : height_candidates) {
+            for (int64_t depth : k_candidates) {
+                Granularity granularity{width, height, depth};
+                const int64_t working_set = EstimateWorkingSetBytes(
+                    problem, graph, candidate.ops, candidate.boundary, granularity);
+                if (working_set > problem.fast_memory_capacity) {
+                    continue;
+                }
+                double proxy_score = EstimateProxyLatency(
+                    problem, graph, candidate.ops, candidate.boundary, granularity);
+                if (config.guidance_mode == GuidanceMode::kConvAccelerator) {
+                    if (config.conv_guidance_variant ==
+                        ConvGuidanceVariant::kAdditivePenaltyV1) {
+                        const ConvGuidanceMetrics conv_metrics =
+                            AnalyzeConvGuidance(problem, graph, candidate.ops, granularity);
+                        if (conv_metrics.valid) {
+                            if (conv_metrics.working_set_bytes >
+                                problem.fast_memory_capacity) {
+                                continue;
+                            }
+                            proxy_score += 0.35 * conv_metrics.ranking_penalty;
+                        }
+                    }
+                }
+                proxy_ranked.push_back({proxy_score, granularity});
+            }
+        }
+    }
+
+    // --- NEW: Inject scheduler-proposed granularities ------------------------
+    if (config.scheduler_propose_granularity) {
+        auto scheduler_proposals = ProposeSchedulerGranularity(
+            problem, graph, candidate.ops, candidate.boundary);
+        for (const auto& proposed : scheduler_proposals) {
+            // Check for duplicates.
+            bool exists = false;
+            for (const auto& [_, g] : proxy_ranked) {
+                if (g.width == proposed.width && g.height == proposed.height &&
+                    g.depth == proposed.depth) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                // Verify working set fits.
+                int64_t ws = EstimateWorkingSetBytes(
+                    problem, graph, candidate.ops, candidate.boundary, proposed);
+                if (ws <= problem.fast_memory_capacity) {
+                    double proxy_score = EstimateProxyLatency(
+                        problem, graph, candidate.ops, candidate.boundary, proposed);
+                    // Give scheduler proposals a slight priority boost (5%).
+                    proxy_ranked.push_back({proxy_score * 0.95, proposed});
+                }
+            }
+        }
+    }
+
+    // --- Analytical tile candidates (same as original) -----------------------
+    {
+        std::set<int64_t> tried_k;
+        for (auto& [score, gran] : proxy_ranked) {
+            tried_k.insert(gran.depth);
+        }
+        std::vector<int64_t> k_steps_to_try(tried_k.begin(), tried_k.end());
+        if (k_steps_to_try.empty()) {
+            k_steps_to_try = BuildKCandidates(problem, candidate.ops);
+        }
+        AddAnalyticalTileCandidates(problem, graph, candidate.ops,
+                                     candidate.boundary, k_steps_to_try,
+                                     &proxy_ranked);
+    }
+
+    // --- Sort and optionally apply V2 reranking ------------------------------
+    std::sort(proxy_ranked.begin(), proxy_ranked.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.first < rhs.first;
+              });
+    if (config.guidance_mode == GuidanceMode::kConvAccelerator &&
+        config.conv_guidance_variant == ConvGuidanceVariant::kLocalRerankV2) {
+        ApplyConvLocalRerankV2(problem, graph, candidate.ops, &proxy_ranked);
+    }
+    if (proxy_ranked.empty()) {
+        return candidate;
+    }
+
+    // --- Evaluate top candidates with official scorer ------------------------
+    const size_t budget = std::min(kGranularityRefineBudget, proxy_ranked.size());
+    for (size_t i = 0; i < budget; ++i) {
+        GroupMetrics metrics = EvaluateGroup(problem, graph, candidate.ops,
+                                             candidate.boundary,
+                                             proxy_ranked[i].second);
+        if (!metrics.valid) {
+            continue;
+        }
+        if (!candidate.metrics.valid || metrics.latency < candidate.metrics.latency) {
+            candidate.granularity = proxy_ranked[i].second;
+            candidate.metrics = metrics;
+        }
+    }
+
+    // --- NEW: Run scheduler analysis on the winning granularity ---------------
+    if (candidate.metrics.valid) {
+        candidate.scheduler = RunSchedulerAnalysis(
+            problem, graph, candidate.ops, candidate.boundary,
+            candidate.granularity);
+    }
+
+    return candidate;
+}
+
+CandidateGroup BuildBestCandidateWithScheduler(
+    const Problem& problem, const OpGraph& graph,
+    size_t start, size_t end, const OptimusConfig& config) {
+    std::vector<size_t> ops;
+    for (size_t i = start; i <= end; ++i) {
+        ops.push_back(graph.topo_order[i]);
+    }
+    return BuildBestCandidateWithScheduler(problem, graph, ops, config);
+}
+
 size_t EstimateMaxGroupSize(const Problem& problem) {
     const int64_t native_tile =
         std::max<int64_t>(1, problem.native_granularity.width) *
@@ -1422,6 +2007,104 @@ SearchDecision SolveFromState(
     return best;
 }
 
+// ---------------------------------------------------------------------------
+// Scheduler-aware DP: same as SolveFromState but uses blended cost.
+// ---------------------------------------------------------------------------
+SearchDecision SolveFromStateWithScheduler(
+    const Problem& problem, const OpGraph& graph,
+    const std::vector<std::vector<CandidateGroup>>& candidates,
+    const std::vector<std::unordered_set<size_t>>& useful_inputs_by_start,
+    size_t start, const std::vector<size_t>& retained_inputs,
+    const OptimusConfig& config,
+    std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash>* memo) {
+    const size_t n = candidates.size();
+    if (start >= n) {
+        SearchDecision terminal;
+        terminal.valid = retained_inputs.empty();
+        terminal.cost = terminal.valid ? 0.0 : kInfinity;
+        return terminal;
+    }
+
+    const SearchStateKey key{
+        start, CanonicalizeRetainedInputs(retained_inputs, useful_inputs_by_start[start])};
+    auto it = memo->find(key);
+    if (it != memo->end()) {
+        return it->second;
+    }
+
+    SearchDecision best;
+
+    for (size_t cand_idx = 0; cand_idx < candidates[start].size(); ++cand_idx) {
+        const auto& candidate = candidates[start][cand_idx];
+        const std::vector<size_t> incoming_used =
+            FilterRetainedInputsForCandidate(candidate, key.retained_inputs);
+        const size_t next_start = candidate.end + 1;
+
+        if (next_start >= n) {
+            if (!IsCapacityFeasible(problem, candidate, incoming_used, {})) {
+                continue;
+            }
+            const double current_cost =
+                [&]() {
+                    GroupMetrics metrics;
+                    if (!EvaluateWithOfficialScorer(problem, candidate.ops,
+                                                    candidate.granularity,
+                                                    incoming_used, {}, &metrics)) {
+                        return kInfinity;
+                    }
+                    return ComputeBlendedCost(metrics.latency,
+                                              candidate.scheduler,
+                                              config.scheduler_cost_weight);
+                }();
+            if (current_cost < best.cost) {
+                best.valid = true;
+                best.cost = current_cost;
+                best.candidate_index = cand_idx;
+                best.retained_outputs.clear();
+            }
+            continue;
+        }
+
+        for (const auto& next_candidate : candidates[next_start]) {
+            const auto retain_choices = EnumerateRetainChoices(
+                problem, candidate, next_candidate, incoming_used);
+            for (const auto& retained_outputs : retain_choices) {
+                if (!IsCapacityFeasible(problem, candidate, incoming_used,
+                                        retained_outputs)) {
+                    continue;
+                }
+                GroupMetrics scored_metrics;
+                if (!EvaluateWithOfficialScorer(problem, candidate.ops,
+                                                candidate.granularity,
+                                                incoming_used, retained_outputs,
+                                                &scored_metrics)) {
+                    continue;
+                }
+                const double current_cost = ComputeBlendedCost(
+                    scored_metrics.latency, candidate.scheduler,
+                    config.scheduler_cost_weight);
+                const SearchDecision future = SolveFromStateWithScheduler(
+                    problem, graph, candidates, useful_inputs_by_start, next_start,
+                    retained_outputs, config, memo);
+                if (!future.valid) {
+                    continue;
+                }
+
+                const double total_cost = current_cost + future.cost;
+                if (total_cost < best.cost) {
+                    best.valid = true;
+                    best.cost = total_cost;
+                    best.candidate_index = cand_idx;
+                    best.retained_outputs = retained_outputs;
+                }
+            }
+        }
+    }
+
+    (*memo)[key] = best;
+    return best;
+}
+
 Solution BuildSolutionFromSchedule(
     const Problem& problem, const std::vector<CandidateGroup>& schedule) {
     Solution solution;
@@ -1540,12 +2223,7 @@ bool IsFusionValid(const OpGraph& graph,
 //                + row_coeff * tile_h * k_step   (MatMul LHS slices)
 //                + col_coeff * tile_w * k_step   (MatMul RHS / weight slices)
 // This models the parameter-refill cost (Point 5) via col_coeff * k_step.
-
-struct TileBufferCoeffs {
-    double area_coeff = 0.0;  // coefficient of tile_h * tile_w
-    double row_coeff  = 0.0;  // coefficient of tile_h * k_step  (LHS slices)
-    double col_coeff  = 0.0;  // coefficient of tile_w * k_step  (RHS/weight slices)
-};
+// (TileBufferCoeffs struct is declared earlier for forward-reference use.)
 
 TileBufferCoeffs ComputeBufferCoeffs(const Problem& problem,
                                       const OpGraph& graph,
@@ -1935,6 +2613,196 @@ Solution SolveWithOptimusConvRerankV2(const Problem& problem) {
 //   ISValid filters are applied when building the group list.
 // - For N > 20: fall back to the existing position-based DP (also benefits
 //   from the analytical tile candidates injected into BuildBestCandidate).
+// ---------------------------------------------------------------------------
+// Scheduler-driven solver: uses BuildBestCandidateWithScheduler for candidate
+// generation and SolveFromStateWithScheduler for DP search.
+// ---------------------------------------------------------------------------
+Solution SolveWithOptimusImplWithScheduler(const Problem& problem,
+                                           const OptimusConfig& config) {
+    g_score_cache.clear();
+    const OpGraph graph = BuildOpGraph(problem);
+
+    // Generate candidates using the scheduler-extended builder.
+    const size_t n = graph.topo_order.size();
+    const size_t max_group_size = EstimateMaxGroupSize(problem);
+    std::vector<std::vector<CandidateGroup>> candidates(n);
+
+    if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth) {
+        std::cerr << "Optimus sched candidates: seed-growth\n";
+        // Seed-growth with scheduler builder.
+        for (size_t topo_idx = 0; topo_idx < n; ++topo_idx) {
+            const size_t seed = graph.topo_order[topo_idx];
+            std::queue<std::vector<size_t>> pending;
+            std::set<std::vector<size_t>> seen;
+            pending.push({seed});
+            seen.insert({seed});
+
+            while (!pending.empty()) {
+                std::vector<size_t> current_ops = pending.front();
+                pending.pop();
+
+                CandidateGroup candidate =
+                    BuildBestCandidateWithScheduler(problem, graph, current_ops, config);
+                if (candidate.metrics.valid &&
+                    IsContiguousTopoSpan(graph, candidate)) {
+                    if (candidate.ops.size() == 1 ||
+                        candidate.internalized_bytes >=
+                            std::max<int64_t>(1, problem.native_granularity.width) *
+                                std::max<int64_t>(1, problem.native_granularity.height)) {
+                        candidates[candidate.start].push_back(candidate);
+                    }
+                }
+
+                if (current_ops.size() >= max_group_size) {
+                    continue;
+                }
+
+                std::unordered_set<size_t> current_set(current_ops.begin(),
+                                                        current_ops.end());
+                std::unordered_set<size_t> frontier;
+                for (size_t op_id : current_ops) {
+                    for (size_t succ : graph.succs[op_id]) {
+                        if (!current_set.count(succ)) {
+                            frontier.insert(succ);
+                        }
+                    }
+                }
+                for (size_t next_op : frontier) {
+                    std::vector<size_t> grown_ops = current_ops;
+                    grown_ops.push_back(next_op);
+                    std::sort(grown_ops.begin(), grown_ops.end(),
+                              [&](size_t lhs, size_t rhs) {
+                                  return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+                              });
+                    if (seen.insert(grown_ops).second) {
+                        pending.push(grown_ops);
+                    }
+                }
+            }
+        }
+
+        // Deduplicate, rank, and cap per start.
+        for (size_t start = 0; start < n; ++start) {
+            auto& cands = candidates[start];
+            std::sort(cands.begin(), cands.end(),
+                      [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                          if (lhs.ops == rhs.ops) {
+                              return lhs.metrics.latency < rhs.metrics.latency;
+                          }
+                          return lhs.ops < rhs.ops;
+                      });
+            cands.erase(
+                std::unique(cands.begin(), cands.end(),
+                            [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                                return lhs.ops == rhs.ops;
+                            }),
+                cands.end());
+            std::sort(cands.begin(), cands.end(),
+                      [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                          const double lhs_solo = static_cast<double>(lhs.ops.size());
+                          const double rhs_solo = static_cast<double>(rhs.ops.size());
+                          const double lhs_density = lhs.internalized_bytes -
+                                                     lhs.metrics.latency / lhs_solo;
+                          const double rhs_density = rhs.internalized_bytes -
+                                                     rhs.metrics.latency / rhs_solo;
+                          if (lhs_density != rhs_density) {
+                              return lhs_density > rhs_density;
+                          }
+                          return lhs.metrics.latency < rhs.metrics.latency;
+                      });
+            if (cands.size() > 8) {
+                cands.resize(8);
+            }
+            if (cands.empty()) {
+                CandidateGroup fallback = BuildBestCandidateWithScheduler(
+                    problem, graph, {graph.topo_order[start]}, config);
+                if (fallback.metrics.valid) {
+                    cands.push_back(std::move(fallback));
+                }
+            }
+        }
+    } else {
+        std::cerr << "Optimus sched candidates: interval\n";
+        // Interval-based with scheduler builder.
+        for (size_t start = 0; start < n; ++start) {
+            for (size_t end = start;
+                 end < n && end < start + max_group_size; ++end) {
+                CandidateGroup candidate =
+                    BuildBestCandidateWithScheduler(problem, graph, start, end, config);
+                if (!candidate.metrics.valid) {
+                    continue;
+                }
+                if (candidate.ops.size() > 1) {
+                    const int64_t min_gain =
+                        std::max<int64_t>(1, problem.native_granularity.width) *
+                        std::max<int64_t>(1, problem.native_granularity.height);
+                    if (candidate.internalized_bytes < min_gain) {
+                        continue;
+                    }
+                }
+                candidates[start].push_back(std::move(candidate));
+            }
+            if (candidates[start].empty()) {
+                CandidateGroup fallback = BuildBestCandidateWithScheduler(
+                    problem, graph, start, start, config);
+                if (fallback.metrics.valid) {
+                    candidates[start].push_back(std::move(fallback));
+                }
+            }
+        }
+    }
+
+    std::cerr << "Optimus sched: weight=" << config.scheduler_cost_weight
+              << " propose=" << (config.scheduler_propose_granularity ? "yes" : "no")
+              << "\n";
+
+    // Build useful inputs map.
+    std::vector<std::unordered_set<size_t>> useful_inputs_by_start(n);
+    for (size_t start = 0; start < n; ++start) {
+        for (const auto& candidate : candidates[start]) {
+            useful_inputs_by_start[start].insert(
+                candidate.boundary.boundary_inputs.begin(),
+                candidate.boundary.boundary_inputs.end());
+        }
+    }
+
+    // Run scheduler-aware DP.
+    std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash> memo;
+    (void)SolveFromStateWithScheduler(problem, graph, candidates,
+                                       useful_inputs_by_start, 0, {}, config,
+                                       &memo);
+
+    // Build solution (uses same reconstruction — evaluator is ground truth).
+    return BuildSolutionFromSearch(problem, graph, candidates,
+                                   useful_inputs_by_start, memo);
+}
+
+Solution SolveWithOptimusSched(const Problem& problem) {
+    OptimusConfig config;
+    config.candidate_mode = GetCandidateGenerationMode();
+    config.guidance_mode = GuidanceMode::kConvAccelerator;
+    config.conv_guidance_variant = ConvGuidanceVariant::kLocalRerankV2;
+
+    // Parse scheduler-specific env vars.
+    const char* weight_raw = std::getenv("MLSYS_SCHED_WEIGHT");
+    if (weight_raw != nullptr) {
+        config.scheduler_cost_weight = std::atof(weight_raw);
+    }
+
+    const char* propose_raw = std::getenv("MLSYS_SCHED_PROPOSE");
+    if (propose_raw != nullptr) {
+        std::string propose_str(propose_raw);
+        std::transform(propose_str.begin(), propose_str.end(), propose_str.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        config.scheduler_propose_granularity =
+            (propose_str != "false" && propose_str != "0" && propose_str != "no");
+    } else {
+        config.scheduler_propose_granularity = true;  // Default: enabled.
+    }
+
+    return SolveWithOptimusImplWithScheduler(problem, config);
+}
+
 Solution SolveWithPaperOptimus(const Problem& problem) {
     g_score_cache.clear();
     const OpGraph graph = BuildOpGraph(problem);
