@@ -223,10 +223,22 @@ Implemented:
 - **L3 (Policy heuristics):** optional conservative rules (tunable/on-off)
 
 ### Tasks
-- [ ] Implement layered legality pipeline (L0→L1→L2→L3)
+- [x] Implement layered legality pipeline (L0→L1→L2→L3)
 - [ ] Convert existing shape rejects into L3 policy wherever possible
+  - blocker: shape-based guard is now in configurable L3 policy, but default behavior still enforces it; need broader benchmarking before relaxing default.
 - [ ] Emit reason codes for every rejection
-- [ ] Add debug trace hooks for reject analysis
+- [x] Add debug trace hooks for reject analysis
+
+### Implemented notes (Phase 2 - incremental)
+- Added explicit staged legality flow in `source/optimus.cpp`:
+  - `RunStaticLegalityChecks(...)` for L0/L1/L3 pre-checks
+  - `EvaluateGroup(...)` for L2 resource + scorer-aligned execution gating
+- Added legality policy/env knobs:
+  - `MLSYS_OPTIMUS_LEGALITY_ENABLE_L3`
+  - `MLSYS_OPTIMUS_LEGALITY_ENFORCE_COMMON_OUTPUT_SHAPE`
+  - `MLSYS_OPTIMUS_LEGALITY_ENFORCE_INTERNALIZED_MULTI_OP`
+- Added legality debug hook:
+  - `MLSYS_OPTIMUS_DEBUG_LEGALITY=1` prints reject level/reason/note during seed-growth expansion.
 
 ### Exit criteria
 - Hard invalid and policy reject are clearly separated.

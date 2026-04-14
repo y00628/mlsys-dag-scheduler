@@ -64,6 +64,7 @@ enum class LegalityReason {
 
 struct LegalityResult {
     bool is_valid = false;
+    LegalityLevel level_passed = LegalityLevel::kL0Graph;
     LegalityLevel failed_level = LegalityLevel::kL0Graph;
     LegalityReason reason = LegalityReason::kNone;
     int64_t estimated_working_set_bytes = 0;
@@ -263,6 +264,12 @@ struct SeedGrowthRuntimeConfig {
     bool require_contiguous_topo = false;
 };
 
+struct LegalityPolicyConfig {
+    bool enable_l3_policy = true;
+    bool enforce_common_output_shape = true;
+    bool enforce_internalized_multi_op = true;
+};
+
 std::unordered_map<ScoreCacheKey, GroupMetrics, ScoreCacheKeyHash> g_score_cache;
 
 int64_t CeilDivInt(int64_t value, int64_t divisor) {
@@ -351,6 +358,11 @@ bool SeedDebugVerboseEnabled() {
     return raw != nullptr && std::string(raw) == "1";
 }
 
+bool LegalityDebugEnabled() {
+    const char* raw = std::getenv("MLSYS_OPTIMUS_DEBUG_LEGALITY");
+    return raw != nullptr && std::string(raw) == "1";
+}
+
 size_t ReadSizeTEnvOrDefault(const char* name, size_t default_value) {
     const char* raw = std::getenv(name);
     if (raw == nullptr) {
@@ -400,6 +412,17 @@ SeedGrowthRuntimeConfig GetSeedGrowthRuntimeConfig() {
     if (!config.allow_predecessor_growth && !config.allow_successor_growth) {
         config.allow_successor_growth = true;
     }
+    return config;
+}
+
+LegalityPolicyConfig GetLegalityPolicyConfig() {
+    LegalityPolicyConfig config;
+    config.enable_l3_policy = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_LEGALITY_ENABLE_L3", true);
+    config.enforce_common_output_shape = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_LEGALITY_ENFORCE_COMMON_OUTPUT_SHAPE", true);
+    config.enforce_internalized_multi_op = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_LEGALITY_ENFORCE_INTERNALIZED_MULTI_OP", true);
     return config;
 }
 
@@ -1481,6 +1504,7 @@ GroupMetrics EvaluateGroup(const Problem& problem, const OpGraph& graph,
         EstimateWorkingSetBytes(problem, graph, ops, boundary, granularity);
     if (legality_out != nullptr) {
         legality_out->is_valid = false;
+        legality_out->level_passed = LegalityLevel::kL1Execution;
         legality_out->failed_level = LegalityLevel::kL2Resource;
         legality_out->reason = LegalityReason::kWorkingSetOOM;
         legality_out->estimated_working_set_bytes = metrics.working_set_bytes;
@@ -1494,6 +1518,7 @@ GroupMetrics EvaluateGroup(const Problem& problem, const OpGraph& graph,
                                     &aligned_metrics)) {
         if (legality_out != nullptr) {
             legality_out->is_valid = false;
+            legality_out->level_passed = LegalityLevel::kL0Graph;
             legality_out->failed_level = LegalityLevel::kL1Execution;
             legality_out->reason = LegalityReason::kScorerRejected;
             legality_out->estimated_working_set_bytes = metrics.working_set_bytes;
@@ -1502,7 +1527,8 @@ GroupMetrics EvaluateGroup(const Problem& problem, const OpGraph& graph,
     }
     if (legality_out != nullptr) {
         legality_out->is_valid = true;
-        legality_out->failed_level = LegalityLevel::kL0Graph;
+        legality_out->level_passed = LegalityLevel::kL2Resource;
+        legality_out->failed_level = LegalityLevel::kL3Policy;
         legality_out->reason = LegalityReason::kNone;
         legality_out->estimated_working_set_bytes = aligned_metrics.working_set_bytes;
         legality_out->debug_note = "valid";
@@ -1512,10 +1538,72 @@ GroupMetrics EvaluateGroup(const Problem& problem, const OpGraph& graph,
     return aligned_metrics;
 }
 
+bool RunStaticLegalityChecks(const Problem& problem, const OpGraph& graph,
+                             CandidateGroup* candidate,
+                             const LegalityPolicyConfig& policy) {
+    if (candidate == nullptr) {
+        return false;
+    }
+    if (candidate->ops.empty()) {
+        candidate->legality.is_valid = false;
+        candidate->legality.level_passed = LegalityLevel::kL0Graph;
+        candidate->legality.failed_level = LegalityLevel::kL0Graph;
+        candidate->legality.reason = LegalityReason::kOrderingConflict;
+        candidate->legality.debug_note = "empty_candidate";
+        return false;
+    }
+
+    if (!IsConnectedSubDAG(graph, candidate->ops)) {
+        candidate->legality.is_valid = false;
+        candidate->legality.level_passed = LegalityLevel::kL0Graph;
+        candidate->legality.failed_level = LegalityLevel::kL0Graph;
+        candidate->legality.reason = LegalityReason::kDisconnectedSubgraph;
+        candidate->legality.violating_ops = candidate->ops;
+        candidate->legality.debug_note = "disconnected_subdag";
+        return false;
+    }
+    candidate->legality.level_passed = LegalityLevel::kL0Graph;
+
+    if (candidate->boundary.boundary_outputs.empty()) {
+        candidate->legality.is_valid = false;
+        candidate->legality.level_passed = LegalityLevel::kL0Graph;
+        candidate->legality.failed_level = LegalityLevel::kL1Execution;
+        candidate->legality.reason = LegalityReason::kBoundaryUnsatisfied;
+        candidate->legality.debug_note = "empty_boundary_outputs";
+        return false;
+    }
+    candidate->legality.level_passed = LegalityLevel::kL1Execution;
+
+    if (policy.enable_l3_policy) {
+        if (policy.enforce_common_output_shape &&
+            !SharesCommonOutputShape(problem, candidate->ops)) {
+            candidate->legality.is_valid = false;
+            candidate->legality.level_passed = LegalityLevel::kL1Execution;
+            candidate->legality.failed_level = LegalityLevel::kL3Policy;
+            candidate->legality.reason = LegalityReason::kHeuristicRejectShape;
+            candidate->legality.debug_note = "shape_policy_reject";
+            return false;
+        }
+        if (policy.enforce_internalized_multi_op && candidate->ops.size() > 1 &&
+            candidate->boundary.internal_tensors.empty()) {
+            candidate->legality.is_valid = false;
+            candidate->legality.level_passed = LegalityLevel::kL1Execution;
+            candidate->legality.failed_level = LegalityLevel::kL3Policy;
+            candidate->legality.reason = LegalityReason::kHeuristicRejectPolicy;
+            candidate->legality.debug_note = "no_internalized_tensor";
+            return false;
+        }
+    }
+
+    candidate->legality.level_passed = LegalityLevel::kL3Policy;
+    return true;
+}
+
 CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
                                   const std::vector<size_t>& input_ops,
                                   const OptimusConfig& config) {
     CandidateGroup candidate;
+    const LegalityPolicyConfig legality_policy = GetLegalityPolicyConfig();
     candidate.ops = input_ops;
     candidate.seed_id = input_ops.empty() ? std::numeric_limits<size_t>::max()
                                           : input_ops.front();
@@ -1526,6 +1614,7 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
               });
     if (candidate.ops.empty()) {
         candidate.legality.is_valid = false;
+        candidate.legality.level_passed = LegalityLevel::kL0Graph;
         candidate.legality.failed_level = LegalityLevel::kL0Graph;
         candidate.legality.reason = LegalityReason::kOrderingConflict;
         return candidate;
@@ -1537,28 +1626,12 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         candidate.topo_footprint.push_back(graph.topo_pos[op_id]);
     }
 
-    if (!SharesCommonOutputShape(problem, candidate.ops)) {
-        candidate.legality.is_valid = false;
-        candidate.legality.failed_level = LegalityLevel::kL3Policy;
-        candidate.legality.reason = LegalityReason::kHeuristicRejectShape;
-        return candidate;
-    }
-    if (!IsConnectedSubDAG(graph, candidate.ops)) {
-        candidate.legality.is_valid = false;
-        candidate.legality.failed_level = LegalityLevel::kL0Graph;
-        candidate.legality.reason = LegalityReason::kDisconnectedSubgraph;
-        return candidate;
-    }
-
     candidate.boundary = ComputeBoundary(problem, graph, candidate.ops);
     for (size_t tensor_id : candidate.boundary.internal_tensors) {
         candidate.internalized_bytes += TensorElements(problem.tensors[tensor_id]);
     }
 
-    if (candidate.ops.size() > 1 && candidate.boundary.internal_tensors.empty()) {
-        candidate.legality.is_valid = false;
-        candidate.legality.failed_level = LegalityLevel::kL3Policy;
-        candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
+    if (!RunStaticLegalityChecks(problem, graph, &candidate, legality_policy)) {
         return candidate;
     }
 
@@ -1643,6 +1716,7 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
             candidate.granularity = proxy_ranked[i].second;
             candidate.metrics = metrics;
             candidate.legality.is_valid = true;
+            candidate.legality.level_passed = LegalityLevel::kL3Policy;
             candidate.legality.reason = LegalityReason::kNone;
             candidate.legality.failed_level = LegalityLevel::kL0Graph;
             candidate.debug_tags = {"best_granularity_selected"};
@@ -2046,11 +2120,19 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
                 if (runtime.require_contiguous_topo &&
                     !IsContiguousTopoSpan(graph, candidate)) {
                     candidate.legality.is_valid = false;
+                    candidate.legality.level_passed = LegalityLevel::kL1Execution;
                     candidate.legality.failed_level = LegalityLevel::kL3Policy;
                     candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
+                    candidate.legality.debug_note = "contiguous_required";
                     ++rejected_candidates;
                     ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
                         candidate.legality.reason)];
+                    if (LegalityDebugEnabled()) {
+                        std::cerr << "  legality_reject start=" << topo_idx
+                                  << " level=" << ToString(candidate.legality.failed_level)
+                                  << " reason=" << ToString(candidate.legality.reason)
+                                  << " note=" << candidate.legality.debug_note << "\n";
+                    }
                     continue;
                 }
                 if (PassSeedPolicyFilter(candidate, problem)) {
@@ -2058,16 +2140,30 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
                     ++accepted_candidates;
                 } else {
                     candidate.legality.is_valid = false;
+                    candidate.legality.level_passed = LegalityLevel::kL1Execution;
                     candidate.legality.failed_level = LegalityLevel::kL3Policy;
                     candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
+                    candidate.legality.debug_note = "seed_policy_filter";
                     ++rejected_candidates;
                     ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
                         candidate.legality.reason)];
+                    if (LegalityDebugEnabled()) {
+                        std::cerr << "  legality_reject start=" << topo_idx
+                                  << " level=" << ToString(candidate.legality.failed_level)
+                                  << " reason=" << ToString(candidate.legality.reason)
+                                  << " note=" << candidate.legality.debug_note << "\n";
+                    }
                 }
             } else {
                 ++rejected_candidates;
                 ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
                     candidate.legality.reason)];
+                if (LegalityDebugEnabled()) {
+                    std::cerr << "  legality_reject start=" << topo_idx
+                              << " level=" << ToString(candidate.legality.failed_level)
+                              << " reason=" << ToString(candidate.legality.reason)
+                              << " note=" << candidate.legality.debug_note << "\n";
+                }
             }
 
             if (current_ops.size() >= max_group_size) {
