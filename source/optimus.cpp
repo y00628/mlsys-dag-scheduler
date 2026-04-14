@@ -44,6 +44,80 @@ struct GroupMetrics {
     double latency = std::numeric_limits<double>::infinity();
 };
 
+enum class LegalityLevel {
+    kL0Graph = 0,
+    kL1Execution,
+    kL2Resource,
+    kL3Policy,
+};
+
+enum class LegalityReason {
+    kNone = 0,
+    kDisconnectedSubgraph,
+    kOrderingConflict,
+    kBoundaryUnsatisfied,
+    kWorkingSetOOM,
+    kHeuristicRejectShape,
+    kHeuristicRejectPolicy,
+    kScorerRejected,
+    kNoFeasibleGranularity,
+    kPartitionCycle,
+    kRuntimeBudgetExceeded,
+};
+
+struct LegalityResult {
+    bool is_valid = false;
+    LegalityLevel level_passed = LegalityLevel::kL0Graph;
+    LegalityLevel failed_level = LegalityLevel::kL0Graph;
+    LegalityReason reason = LegalityReason::kNone;
+    int64_t estimated_working_set_bytes = 0;
+    std::vector<size_t> violating_ops;
+    std::vector<size_t> violating_tensors;
+    std::string debug_note;
+};
+
+const char* ToString(LegalityLevel level) {
+    switch (level) {
+        case LegalityLevel::kL0Graph:
+            return "L0_GRAPH";
+        case LegalityLevel::kL1Execution:
+            return "L1_EXECUTION";
+        case LegalityLevel::kL2Resource:
+            return "L2_RESOURCE";
+        case LegalityLevel::kL3Policy:
+            return "L3_POLICY";
+    }
+    return "UNKNOWN_LEVEL";
+}
+
+const char* ToString(LegalityReason reason) {
+    switch (reason) {
+        case LegalityReason::kNone:
+            return "NONE";
+        case LegalityReason::kDisconnectedSubgraph:
+            return "DISCONNECTED_SUBGRAPH";
+        case LegalityReason::kOrderingConflict:
+            return "ORDERING_CONFLICT";
+        case LegalityReason::kBoundaryUnsatisfied:
+            return "BOUNDARY_UNSATISFIED";
+        case LegalityReason::kWorkingSetOOM:
+            return "WORKING_SET_OOM";
+        case LegalityReason::kHeuristicRejectShape:
+            return "HEURISTIC_REJECT_SHAPE";
+        case LegalityReason::kHeuristicRejectPolicy:
+            return "HEURISTIC_REJECT_POLICY";
+        case LegalityReason::kScorerRejected:
+            return "SCORER_REJECTED";
+        case LegalityReason::kNoFeasibleGranularity:
+            return "NO_FEASIBLE_GRANULARITY";
+        case LegalityReason::kPartitionCycle:
+            return "PARTITION_CYCLE";
+        case LegalityReason::kRuntimeBudgetExceeded:
+            return "RUNTIME_BUDGET_EXCEEDED";
+    }
+    return "UNKNOWN_REASON";
+}
+
 struct StepEstimate {
     int64_t active_bytes = 0;
     int64_t output_write_bytes = 0;
@@ -65,9 +139,13 @@ struct CandidateGroup {
     size_t start = 0;
     size_t end = 0;
     std::vector<size_t> ops;
+    size_t seed_id = std::numeric_limits<size_t>::max();
+    size_t growth_depth = 0;
+    std::vector<size_t> topo_footprint;
     GroupBoundary boundary;
     Granularity granularity{};
     GroupMetrics metrics;
+    LegalityResult legality;
     int64_t internalized_bytes = 0;
     SchedulerEstimate scheduler;  // Scheduler analysis (optional, default invalid)
 };
@@ -170,10 +248,37 @@ struct ScoreCacheKeyHash {
     }
 };
 
+struct OpVectorHash {
+    size_t operator()(const std::vector<size_t>& ops) const {
+        size_t h = 0;
+        for (size_t op_id : ops) {
+            h ^= std::hash<size_t>{}(op_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+};
+
 constexpr double kInfinity = std::numeric_limits<double>::infinity();
 constexpr size_t kDefaultMaxGroupSize = 8;
 constexpr size_t kGranularityRefineBudget = 6;
 constexpr size_t kConvRerankBudget = 8;
+
+struct SeedGrowthRuntimeConfig {
+    size_t max_group_size_override = 0;
+    size_t max_frontier = 128;
+    size_t max_candidates_per_start = 8;
+    size_t total_queue_budget = 50000;
+    size_t max_states_per_seed = 0;
+    bool allow_predecessor_growth = true;
+    bool allow_successor_growth = true;
+    bool require_contiguous_topo = false;
+};
+
+struct LegalityPolicyConfig {
+    bool enable_l3_policy = true;
+    bool enforce_common_output_shape = true;
+    bool enforce_internalized_multi_op = true;
+};
 
 std::unordered_map<ScoreCacheKey, GroupMetrics, ScoreCacheKeyHash> g_score_cache;
 
@@ -195,6 +300,19 @@ int64_t TensorBytesForSet(const Problem& problem,
         total += TensorElements(problem.tensors[tensor_id]);
     }
     return total;
+}
+
+int64_t ReadInt64EnvOrDefault(const char* name, int64_t default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    char* end = nullptr;
+    const long long parsed = std::strtoll(raw, &end, 10);
+    if (end == raw) {
+        return default_value;
+    }
+    return static_cast<int64_t>(parsed);
 }
 
 int64_t MatMulK(const Problem& problem, size_t op_id) {
@@ -225,7 +343,7 @@ bool ContainsMatMul(const Problem& problem, const std::vector<size_t>& ops) {
 CandidateGenerationMode GetCandidateGenerationMode() {
     const char* raw = std::getenv("MLSYS_OPTIMUS_CANDIDATES");
     if (raw == nullptr) {
-        return CandidateGenerationMode::kInterval;
+        return CandidateGenerationMode::kSeedGrowth;
     }
 
     std::string mode(raw);
@@ -237,12 +355,87 @@ CandidateGenerationMode GetCandidateGenerationMode() {
     if (mode == "seed" || mode == "seed-growth" || mode == "seed_growth") {
         return CandidateGenerationMode::kSeedGrowth;
     }
-    return CandidateGenerationMode::kInterval;
+    return CandidateGenerationMode::kSeedGrowth;
 }
 
 bool SeedDebugEnabled() {
     const char* raw = std::getenv("MLSYS_OPTIMUS_DEBUG_SEED");
     return raw != nullptr && std::string(raw) == "1";
+}
+
+bool SeedDebugVerboseEnabled() {
+    const char* raw = std::getenv("MLSYS_OPTIMUS_DEBUG_SEED_VERBOSE");
+    return raw != nullptr && std::string(raw) == "1";
+}
+
+bool LegalityDebugEnabled() {
+    const char* raw = std::getenv("MLSYS_OPTIMUS_DEBUG_LEGALITY");
+    return raw != nullptr && std::string(raw) == "1";
+}
+
+size_t ReadSizeTEnvOrDefault(const char* name, size_t default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(raw, &end, 10);
+    if (end == raw) {
+        return default_value;
+    }
+    return static_cast<size_t>(parsed);
+}
+
+bool ReadBoolEnvOrDefault(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" || value == "off") {
+        return false;
+    }
+    return default_value;
+}
+
+SeedGrowthRuntimeConfig GetSeedGrowthRuntimeConfig() {
+    SeedGrowthRuntimeConfig config;
+    config.max_group_size_override =
+        ReadSizeTEnvOrDefault("MLSYS_OPTIMUS_SEED_MAX_GROUP", 0);
+    config.max_frontier =
+        std::max<size_t>(1, ReadSizeTEnvOrDefault("MLSYS_OPTIMUS_SEED_MAX_FRONTIER", 128));
+    config.max_candidates_per_start = std::max<size_t>(
+        1, ReadSizeTEnvOrDefault("MLSYS_OPTIMUS_SEED_MAX_CANDIDATES_PER_START", 8));
+    config.total_queue_budget = std::max<size_t>(
+        1, ReadSizeTEnvOrDefault("MLSYS_OPTIMUS_SEED_TOTAL_QUEUE_BUDGET", 50000));
+    config.max_states_per_seed = ReadSizeTEnvOrDefault(
+        "MLSYS_OPTIMUS_SEED_MAX_STATES_PER_SEED", 0);
+    config.allow_predecessor_growth = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_SEED_ALLOW_PRED", true);
+    config.allow_successor_growth = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_SEED_ALLOW_SUCC", true);
+    config.require_contiguous_topo = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_SEED_REQUIRE_CONTIGUOUS", false);
+    if (!config.allow_predecessor_growth && !config.allow_successor_growth) {
+        config.allow_successor_growth = true;
+    }
+    return config;
+}
+
+LegalityPolicyConfig GetLegalityPolicyConfig() {
+    LegalityPolicyConfig config;
+    config.enable_l3_policy = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_LEGALITY_ENABLE_L3", true);
+    config.enforce_common_output_shape = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_LEGALITY_ENFORCE_COMMON_OUTPUT_SHAPE", true);
+    config.enforce_internalized_multi_op = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_LEGALITY_ENFORCE_INTERNALIZED_MULTI_OP", true);
+    return config;
 }
 
 ConvDataflow ParseConvDataflow() {
@@ -321,6 +514,21 @@ OpGraph BuildOpGraph(const Problem& problem) {
     }
 
     return graph;
+}
+
+std::vector<size_t> CanonicalizeOpSet(const std::vector<size_t>& ops,
+                                      const OpGraph& graph) {
+    std::vector<size_t> canonical = ops;
+    std::sort(canonical.begin(), canonical.end(),
+              [&](size_t lhs, size_t rhs) {
+                  return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+              });
+    canonical.erase(std::unique(canonical.begin(), canonical.end()), canonical.end());
+    return canonical;
+}
+
+std::vector<size_t> CandidateKeyFromOps(const std::vector<size_t>& canonical_ops) {
+    return canonical_ops;
 }
 
 bool SharesCommonOutputShape(const Problem& problem,
@@ -1301,10 +1509,18 @@ bool EvaluateWithOfficialScorer(const Problem& problem,
 GroupMetrics EvaluateGroup(const Problem& problem, const OpGraph& graph,
                            const std::vector<size_t>& ops,
                            const GroupBoundary& boundary,
-                           const Granularity& granularity) {
+                           const Granularity& granularity,
+                           LegalityResult* legality_out) {
     GroupMetrics metrics;
     metrics.working_set_bytes =
         EstimateWorkingSetBytes(problem, graph, ops, boundary, granularity);
+    if (legality_out != nullptr) {
+        legality_out->is_valid = false;
+        legality_out->level_passed = LegalityLevel::kL1Execution;
+        legality_out->failed_level = LegalityLevel::kL2Resource;
+        legality_out->reason = LegalityReason::kWorkingSetOOM;
+        legality_out->estimated_working_set_bytes = metrics.working_set_bytes;
+    }
     if (metrics.working_set_bytes > problem.fast_memory_capacity) {
         return metrics;
     }
@@ -1312,33 +1528,114 @@ GroupMetrics EvaluateGroup(const Problem& problem, const OpGraph& graph,
     GroupMetrics aligned_metrics;
     if (!EvaluateWithOfficialScorer(problem, ops, granularity, {}, {},
                                     &aligned_metrics)) {
+        if (legality_out != nullptr) {
+            legality_out->is_valid = false;
+            legality_out->level_passed = LegalityLevel::kL0Graph;
+            legality_out->failed_level = LegalityLevel::kL1Execution;
+            legality_out->reason = LegalityReason::kScorerRejected;
+            legality_out->estimated_working_set_bytes = metrics.working_set_bytes;
+        }
         return metrics;
+    }
+    if (legality_out != nullptr) {
+        legality_out->is_valid = true;
+        legality_out->level_passed = LegalityLevel::kL2Resource;
+        legality_out->failed_level = LegalityLevel::kL3Policy;
+        legality_out->reason = LegalityReason::kNone;
+        legality_out->estimated_working_set_bytes = aligned_metrics.working_set_bytes;
+        legality_out->debug_note = "valid";
     }
     aligned_metrics.working_set_bytes =
         std::max(aligned_metrics.working_set_bytes, metrics.working_set_bytes);
     return aligned_metrics;
 }
 
+bool RunStaticLegalityChecks(const Problem& problem, const OpGraph& graph,
+                             CandidateGroup* candidate,
+                             const LegalityPolicyConfig& policy) {
+    if (candidate == nullptr) {
+        return false;
+    }
+    if (candidate->ops.empty()) {
+        candidate->legality.is_valid = false;
+        candidate->legality.level_passed = LegalityLevel::kL0Graph;
+        candidate->legality.failed_level = LegalityLevel::kL0Graph;
+        candidate->legality.reason = LegalityReason::kOrderingConflict;
+        candidate->legality.debug_note = "empty_candidate";
+        return false;
+    }
+
+    if (!IsConnectedSubDAG(graph, candidate->ops)) {
+        candidate->legality.is_valid = false;
+        candidate->legality.level_passed = LegalityLevel::kL0Graph;
+        candidate->legality.failed_level = LegalityLevel::kL0Graph;
+        candidate->legality.reason = LegalityReason::kDisconnectedSubgraph;
+        candidate->legality.violating_ops = candidate->ops;
+        candidate->legality.debug_note = "disconnected_subdag";
+        return false;
+    }
+    candidate->legality.level_passed = LegalityLevel::kL0Graph;
+
+    if (candidate->boundary.boundary_outputs.empty()) {
+        candidate->legality.is_valid = false;
+        candidate->legality.level_passed = LegalityLevel::kL0Graph;
+        candidate->legality.failed_level = LegalityLevel::kL1Execution;
+        candidate->legality.reason = LegalityReason::kBoundaryUnsatisfied;
+        candidate->legality.debug_note = "empty_boundary_outputs";
+        return false;
+    }
+    candidate->legality.level_passed = LegalityLevel::kL1Execution;
+
+    if (policy.enable_l3_policy) {
+        if (policy.enforce_common_output_shape &&
+            !SharesCommonOutputShape(problem, candidate->ops)) {
+            candidate->legality.is_valid = false;
+            candidate->legality.level_passed = LegalityLevel::kL1Execution;
+            candidate->legality.failed_level = LegalityLevel::kL3Policy;
+            candidate->legality.reason = LegalityReason::kHeuristicRejectShape;
+            candidate->legality.debug_note = "shape_policy_reject";
+            return false;
+        }
+        if (policy.enforce_internalized_multi_op && candidate->ops.size() > 1 &&
+            candidate->boundary.internal_tensors.empty()) {
+            candidate->legality.is_valid = false;
+            candidate->legality.level_passed = LegalityLevel::kL1Execution;
+            candidate->legality.failed_level = LegalityLevel::kL3Policy;
+            candidate->legality.reason = LegalityReason::kHeuristicRejectPolicy;
+            candidate->legality.debug_note = "no_internalized_tensor";
+            return false;
+        }
+    }
+
+    candidate->legality.level_passed = LegalityLevel::kL3Policy;
+    return true;
+}
+
 CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
                                   const std::vector<size_t>& input_ops,
                                   const OptimusConfig& config) {
     CandidateGroup candidate;
+    const LegalityPolicyConfig legality_policy = GetLegalityPolicyConfig();
     candidate.ops = input_ops;
+    candidate.seed_id = input_ops.empty() ? std::numeric_limits<size_t>::max()
+                                          : input_ops.front();
+    candidate.growth_depth = input_ops.size();
     std::sort(candidate.ops.begin(), candidate.ops.end(),
               [&](size_t lhs, size_t rhs) {
                   return graph.topo_pos[lhs] < graph.topo_pos[rhs];
               });
     if (candidate.ops.empty()) {
+        candidate.legality.is_valid = false;
+        candidate.legality.level_passed = LegalityLevel::kL0Graph;
+        candidate.legality.failed_level = LegalityLevel::kL0Graph;
+        candidate.legality.reason = LegalityReason::kOrderingConflict;
         return candidate;
     }
     candidate.start = graph.topo_pos[candidate.ops.front()];
     candidate.end = graph.topo_pos[candidate.ops.back()];
-
-    if (!SharesCommonOutputShape(problem, candidate.ops)) {
-        return candidate;
-    }
-    if (!IsConnectedSubDAG(graph, candidate.ops)) {
-        return candidate;
+    candidate.topo_footprint.reserve(candidate.ops.size());
+    for (size_t op_id : candidate.ops) {
+        candidate.topo_footprint.push_back(graph.topo_pos[op_id]);
     }
 
     candidate.boundary = ComputeBoundary(problem, graph, candidate.ops);
@@ -1346,7 +1643,7 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         candidate.internalized_bytes += TensorElements(problem.tensors[tensor_id]);
     }
 
-    if (candidate.ops.size() > 1 && candidate.boundary.internal_tensors.empty()) {
+    if (!RunStaticLegalityChecks(problem, graph, &candidate, legality_policy)) {
         return candidate;
     }
 
@@ -1415,6 +1712,11 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         ApplyConvLocalRerankV2(problem, graph, candidate.ops, &proxy_ranked);
     }
     if (proxy_ranked.empty()) {
+        candidate.legality.is_valid = false;
+        candidate.legality.level_passed = LegalityLevel::kL1Execution;
+        candidate.legality.failed_level = LegalityLevel::kL2Resource;
+        candidate.legality.reason = LegalityReason::kNoFeasibleGranularity;
+        candidate.legality.debug_note = "no_proxy_granularity";
         return candidate;
     }
 
@@ -1422,13 +1724,29 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
     for (size_t i = 0; i < budget; ++i) {
         GroupMetrics metrics = EvaluateGroup(problem, graph, candidate.ops,
                                              candidate.boundary,
-                                             proxy_ranked[i].second);
+                                             proxy_ranked[i].second,
+                                             &candidate.legality);
         if (!metrics.valid) {
             continue;
         }
         if (!candidate.metrics.valid || metrics.latency < candidate.metrics.latency) {
             candidate.granularity = proxy_ranked[i].second;
             candidate.metrics = metrics;
+            candidate.legality.is_valid = true;
+            candidate.legality.level_passed = LegalityLevel::kL3Policy;
+            candidate.legality.reason = LegalityReason::kNone;
+            candidate.legality.failed_level = LegalityLevel::kL0Graph;
+            candidate.debug_tags = {"best_granularity_selected"};
+        }
+    }
+
+    if (!candidate.metrics.valid) {
+        candidate.legality.is_valid = false;
+        if (candidate.legality.reason == LegalityReason::kNone) {
+            candidate.legality.level_passed = LegalityLevel::kL1Execution;
+            candidate.legality.failed_level = LegalityLevel::kL2Resource;
+            candidate.legality.reason = LegalityReason::kNoFeasibleGranularity;
+            candidate.legality.debug_note = "granularity_refine_exhausted";
         }
     }
 
@@ -1635,9 +1953,14 @@ size_t EstimateMaxGroupSize(const Problem& problem) {
 
 std::vector<std::vector<CandidateGroup>> GenerateCandidates(
     const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
+    constexpr size_t kReasonCount =
+        static_cast<size_t>(LegalityReason::kRuntimeBudgetExceeded) + 1;
     const size_t n = graph.topo_order.size();
     const size_t max_group_size = EstimateMaxGroupSize(problem);
     std::vector<std::vector<CandidateGroup>> by_start(n);
+    std::vector<size_t> rejected_candidates_by_start(n, 0);
+    std::vector<std::vector<size_t>> reject_reasons_by_start(
+        n, std::vector<size_t>(kReasonCount, 0));
 
     for (size_t start = 0; start < n; ++start) {
         for (size_t end = start;
@@ -1645,6 +1968,15 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
             CandidateGroup candidate =
                 BuildBestCandidate(problem, graph, start, end, config);
             if (!candidate.metrics.valid) {
+                ++rejected_candidates_by_start[start];
+                ++reject_reasons_by_start[start][
+                    static_cast<size_t>(candidate.legality.reason)];
+                if (LegalityDebugEnabled()) {
+                    std::cerr << "  legality_reject(interval) start=" << start
+                              << " level=" << ToString(candidate.legality.failed_level)
+                              << " reason=" << ToString(candidate.legality.reason)
+                              << " note=" << candidate.legality.debug_note << "\n";
+                }
                 continue;
             }
 
@@ -1653,6 +1985,20 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
                     std::max<int64_t>(1, problem.native_granularity.width) *
                     std::max<int64_t>(1, problem.native_granularity.height);
                 if (candidate.internalized_bytes < min_gain) {
+                    candidate.legality.is_valid = false;
+                    candidate.legality.level_passed = LegalityLevel::kL1Execution;
+                    candidate.legality.failed_level = LegalityLevel::kL3Policy;
+                    candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
+                    candidate.legality.debug_note = "interval_min_internalized";
+                    ++rejected_candidates_by_start[start];
+                    ++reject_reasons_by_start[start][
+                        static_cast<size_t>(candidate.legality.reason)];
+                    if (LegalityDebugEnabled()) {
+                        std::cerr << "  legality_reject(interval) start=" << start
+                                  << " level=" << ToString(candidate.legality.failed_level)
+                                  << " reason=" << ToString(candidate.legality.reason)
+                                  << " note=" << candidate.legality.debug_note << "\n";
+                    }
                     continue;
                 }
             }
@@ -1667,9 +2013,83 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
                 by_start[start].push_back(std::move(fallback));
             }
         }
+
+        if (SeedDebugEnabled() || LegalityDebugEnabled()) {
+            std::cerr << "interval start " << start
+                      << " candidates=" << by_start[start].size()
+                      << " rejected=" << rejected_candidates_by_start[start] << "\n";
+            std::vector<std::pair<size_t, size_t>> reason_counts;
+            for (size_t i = 0; i < reject_reasons_by_start[start].size(); ++i) {
+                const size_t count = reject_reasons_by_start[start][i];
+                if (count > 0) {
+                    reason_counts.push_back({count, i});
+                }
+            }
+            std::sort(reason_counts.begin(), reason_counts.end(),
+                      [](const auto& lhs, const auto& rhs) {
+                          return lhs.first > rhs.first;
+                      });
+            if (!reason_counts.empty()) {
+                std::cerr << "  reject_reasons:";
+                const size_t top_k = std::min<size_t>(3, reason_counts.size());
+                for (size_t i = 0; i < top_k; ++i) {
+                    const auto reason = static_cast<LegalityReason>(reason_counts[i].second);
+                    std::cerr << " " << ToString(reason) << "=" << reason_counts[i].first;
+                }
+                std::cerr << "\n";
+            }
+        }
     }
 
     return by_start;
+}
+
+std::vector<size_t> CollectGrowthFrontier(
+    const OpGraph& graph, const std::vector<size_t>& current_ops,
+    bool allow_predecessor_growth, bool allow_successor_growth,
+    size_t max_frontier) {
+    std::unordered_set<size_t> current_set(current_ops.begin(), current_ops.end());
+    std::vector<size_t> frontier;
+    frontier.reserve(max_frontier);
+
+    auto try_add = [&](size_t op_id) {
+        if (current_set.count(op_id)) {
+            return;
+        }
+        frontier.push_back(op_id);
+    };
+
+    for (size_t op_id : current_ops) {
+        if (allow_successor_growth) {
+            for (size_t succ : graph.succs[op_id]) {
+                try_add(succ);
+            }
+        }
+        if (allow_predecessor_growth) {
+            for (size_t pred : graph.preds[op_id]) {
+                try_add(pred);
+            }
+        }
+    }
+
+    frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
+
+    // Smart frontier sorting: prioritize nodes that connect to multiple branches
+    // (higher degree = more growth opportunity) then by topo order
+    std::sort(frontier.begin(), frontier.end(),
+              [&](size_t lhs, size_t rhs) {
+                  const size_t lhs_degree = graph.succs[lhs].size() + graph.preds[lhs].size();
+                  const size_t rhs_degree = graph.succs[rhs].size() + graph.preds[rhs].size();
+                  if (lhs_degree != rhs_degree) {
+                      return lhs_degree > rhs_degree;  // Higher degree first
+                  }
+                  return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+              });
+
+    if (frontier.size() > max_frontier) {
+        frontier.resize(max_frontier);
+    }
+    return frontier;
 }
 
 bool IsContiguousTopoSpan(const OpGraph& graph, const CandidateGroup& candidate) {
@@ -1687,30 +2107,204 @@ bool IsContiguousTopoSpan(const OpGraph& graph, const CandidateGroup& candidate)
     return true;
 }
 
+bool PassSeedPolicyFilter(const CandidateGroup& candidate,
+                          const Problem& problem) {
+    if (candidate.ops.size() <= 1) {
+        return true;
+    }
+
+    const bool enforce_internalized_threshold = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_SEED_POLICY_ENFORCE_INTERNALIZED", true);
+    if (!enforce_internalized_threshold) {
+        return true;
+    }
+
+    const int64_t default_min_internalized =
+        std::max<int64_t>(1, problem.native_granularity.width) *
+        std::max<int64_t>(1, problem.native_granularity.height);
+    const int64_t min_internalized = std::max<int64_t>(
+        0, ReadInt64EnvOrDefault("MLSYS_OPTIMUS_SEED_POLICY_MIN_INTERNALIZED",
+                                 default_min_internalized));
+    return candidate.internalized_bytes >= min_internalized;
+}
+
+void RankAndTrimSeedCandidates(std::vector<CandidateGroup>* candidates,
+                               size_t max_candidates) {
+    if (candidates == nullptr) {
+        return;
+    }
+
+    std::sort(candidates->begin(), candidates->end(),
+              [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                  if (lhs.ops == rhs.ops) {
+                      return lhs.metrics.latency < rhs.metrics.latency;
+                  }
+                  return lhs.ops < rhs.ops;
+              });
+    candidates->erase(
+        std::unique(candidates->begin(), candidates->end(),
+                    [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                        return lhs.ops == rhs.ops;
+                    }),
+        candidates->end());
+
+    std::sort(candidates->begin(), candidates->end(),
+              [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                  const double lhs_solo = static_cast<double>(lhs.ops.size());
+                  const double rhs_solo = static_cast<double>(rhs.ops.size());
+                  const double lhs_density = lhs.internalized_bytes -
+                                             lhs.metrics.latency / lhs_solo;
+                  const double rhs_density = rhs.internalized_bytes -
+                                             rhs.metrics.latency / rhs_solo;
+                  if (lhs_density != rhs_density) {
+                      return lhs_density > rhs_density;
+                  }
+                  return lhs.metrics.latency < rhs.metrics.latency;
+              });
+
+    if (candidates->size() > max_candidates) {
+        candidates->resize(max_candidates);
+    }
+}
+
 std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
+    constexpr size_t kReasonCount =
+        static_cast<size_t>(LegalityReason::kRuntimeBudgetExceeded) + 1;
     const size_t n = graph.topo_order.size();
-    const size_t max_group_size = EstimateMaxGroupSize(problem);
+    const SeedGrowthRuntimeConfig runtime = GetSeedGrowthRuntimeConfig();
+    const size_t max_states_per_seed =
+        runtime.max_states_per_seed > 0
+            ? runtime.max_states_per_seed
+            : std::min<size_t>(1500, std::max<size_t>(400, n * 20));
+    const size_t estimated_group_size = EstimateMaxGroupSize(problem);
+    const size_t max_group_size = runtime.max_group_size_override > 0
+                                      ? std::min(runtime.max_group_size_override,
+                                                 std::max<size_t>(1, n))
+                                      : estimated_group_size;
     std::vector<std::vector<CandidateGroup>> by_start(n);
+    std::vector<size_t> explored_states_by_start(n, 0);
+    std::vector<size_t> accepted_candidates_by_start(n, 0);
+    std::vector<size_t> rejected_candidates_by_start(n, 0);
+    std::vector<std::vector<size_t>> reject_reasons_by_start(
+        n, std::vector<size_t>(kReasonCount, 0));
+    std::unordered_map<std::vector<size_t>, CandidateGroup, OpVectorHash> candidate_cache;
+    candidate_cache.reserve(std::max<size_t>(1024, runtime.total_queue_budget / 2));
+    size_t global_queue_pushes = 0;
 
     for (size_t topo_idx = 0; topo_idx < n; ++topo_idx) {
         const size_t seed = graph.topo_order[topo_idx];
         std::queue<std::vector<size_t>> pending;
-        std::set<std::vector<size_t>> seen;
-        pending.push({seed});
-        seen.insert({seed});
+        std::unordered_set<std::vector<size_t>, OpVectorHash> seen;
+        size_t explored_states = 0;
+        size_t accepted_candidates = 0;
+        size_t rejected_candidates = 0;
+        double best_latency = std::numeric_limits<double>::max();
+        size_t iterations_without_improvement = 0;
+        constexpr size_t kMaxIterationsWithoutImprovement = 20;  // More aggressive early termination
+
+        const std::vector<size_t> seed_ops = CandidateKeyFromOps(
+            CanonicalizeOpSet({seed}, graph));
+        pending.push(seed_ops);
+        ++global_queue_pushes;
+        seen.insert(seed_ops);
 
         while (!pending.empty()) {
             std::vector<size_t> current_ops = pending.front();
             pending.pop();
+            ++explored_states;
 
-            CandidateGroup candidate =
-                BuildBestCandidate(problem, graph, current_ops, config);
-            if (candidate.metrics.valid && IsContiguousTopoSpan(graph, candidate)) {
-                if (candidate.ops.size() == 1 || candidate.internalized_bytes >=
-                        std::max<int64_t>(1, problem.native_granularity.width) *
-                            std::max<int64_t>(1, problem.native_granularity.height)) {
+            if (explored_states > max_states_per_seed) {
+                ++rejected_candidates;
+                ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
+                    LegalityReason::kRuntimeBudgetExceeded)];
+                if (LegalityDebugEnabled()) {
+                    std::cerr << "  legality_reject start=" << topo_idx
+                              << " level=" << ToString(LegalityLevel::kL3Policy)
+                              << " reason=" << ToString(LegalityReason::kRuntimeBudgetExceeded)
+                              << " note=seed_state_budget_exceeded\n";
+                }
+                break;
+            }
+
+            // Early termination: if no improvement for many iterations, skip this seed
+            // (likely exhausted high-quality expansion directions)
+            if (iterations_without_improvement > kMaxIterationsWithoutImprovement) {
+                if (LegalityDebugEnabled()) {
+                    std::cerr << "  seed_growth early_termination start=" << topo_idx
+                              << " iterations_no_progress=" << iterations_without_improvement << "\n";
+                }
+                break;
+            }
+
+            CandidateGroup candidate;
+            const auto cached = candidate_cache.find(current_ops);
+            if (cached != candidate_cache.end()) {
+                candidate = cached->second;
+            } else {
+                candidate = BuildBestCandidate(problem, graph, current_ops, config);
+                candidate_cache.emplace(current_ops, candidate);
+            }
+
+            // Track progress: update iteration counter and best latency
+            if (candidate.metrics.valid) {
+                if (candidate.metrics.latency < best_latency) {
+                    best_latency = candidate.metrics.latency;
+                    iterations_without_improvement = 0;  // Reset counter
+                } else {
+                    ++iterations_without_improvement;
+                }
+            } else {
+                ++iterations_without_improvement;
+            }
+
+            if (candidate.metrics.valid) {
+                if (runtime.require_contiguous_topo &&
+                    !IsContiguousTopoSpan(graph, candidate)) {
+                    candidate.legality.is_valid = false;
+                    candidate.legality.level_passed = LegalityLevel::kL1Execution;
+                    candidate.legality.failed_level = LegalityLevel::kL3Policy;
+                    candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
+                    candidate.legality.debug_note = "contiguous_required";
+                    ++rejected_candidates;
+                    ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
+                        candidate.legality.reason)];
+                    if (LegalityDebugEnabled()) {
+                        std::cerr << "  legality_reject start=" << topo_idx
+                                  << " level=" << ToString(candidate.legality.failed_level)
+                                  << " reason=" << ToString(candidate.legality.reason)
+                                  << " note=" << candidate.legality.debug_note << "\n";
+                    }
+                    continue;
+                }
+                if (PassSeedPolicyFilter(candidate, problem)) {
                     by_start[candidate.start].push_back(candidate);
+                    ++accepted_candidates;
+                } else {
+                    candidate.legality.is_valid = false;
+                    candidate.legality.level_passed = LegalityLevel::kL1Execution;
+                    candidate.legality.failed_level = LegalityLevel::kL3Policy;
+                    candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
+                    candidate.legality.debug_note = "seed_policy_filter";
+                    ++rejected_candidates;
+                    ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
+                        candidate.legality.reason)];
+                    if (LegalityDebugEnabled()) {
+                        std::cerr << "  legality_reject start=" << topo_idx
+                                  << " level=" << ToString(candidate.legality.failed_level)
+                                  << " reason=" << ToString(candidate.legality.reason)
+                                  << " note=" << candidate.legality.debug_note << "\n";
+                    }
+                }
+            } else {
+                ++rejected_candidates;
+                ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
+                    candidate.legality.reason)];
+                if (LegalityDebugEnabled()) {
+                    std::cerr << "  legality_reject start=" << topo_idx
+                              << " level=" << ToString(candidate.legality.failed_level)
+                              << " reason=" << ToString(candidate.legality.reason)
+                              << " note=" << candidate.legality.debug_note << "\n";
                 }
             }
 
@@ -1718,62 +2312,33 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
                 continue;
             }
 
-            std::unordered_set<size_t> current_set(current_ops.begin(), current_ops.end());
-            std::unordered_set<size_t> frontier;
-            for (size_t op_id : current_ops) {
-                for (size_t succ : graph.succs[op_id]) {
-                    if (!current_set.count(succ)) {
-                        frontier.insert(succ);
-                    }
-                }
-            }
+            const std::vector<size_t> frontier = CollectGrowthFrontier(
+                graph, current_ops, runtime.allow_predecessor_growth,
+                runtime.allow_successor_growth, runtime.max_frontier);
 
             for (size_t next_op : frontier) {
+                if (global_queue_pushes >= runtime.total_queue_budget) {
+                    break;
+                }
                 std::vector<size_t> grown_ops = current_ops;
                 grown_ops.push_back(next_op);
-                std::sort(grown_ops.begin(), grown_ops.end(),
-                          [&](size_t lhs, size_t rhs) {
-                              return graph.topo_pos[lhs] < graph.topo_pos[rhs];
-                          });
-                if (seen.insert(grown_ops).second) {
-                    pending.push(grown_ops);
+                const std::vector<size_t> canonical_ops = CandidateKeyFromOps(
+                    CanonicalizeOpSet(grown_ops, graph));
+                if (seen.insert(canonical_ops).second) {
+                    pending.push(canonical_ops);
+                    ++global_queue_pushes;
                 }
             }
         }
+
+        explored_states_by_start[topo_idx] = explored_states;
+        accepted_candidates_by_start[topo_idx] = accepted_candidates;
+        rejected_candidates_by_start[topo_idx] = rejected_candidates;
     }
 
     for (size_t start = 0; start < n; ++start) {
         auto& candidates = by_start[start];
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
-                      if (lhs.ops == rhs.ops) {
-                          return lhs.metrics.latency < rhs.metrics.latency;
-                      }
-                      return lhs.ops < rhs.ops;
-                  });
-        candidates.erase(
-            std::unique(candidates.begin(), candidates.end(),
-                        [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
-                            return lhs.ops == rhs.ops;
-                        }),
-            candidates.end());
-
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
-                      const double lhs_solo = static_cast<double>(lhs.ops.size());
-                      const double rhs_solo = static_cast<double>(rhs.ops.size());
-                      const double lhs_density = lhs.internalized_bytes -
-                                                 lhs.metrics.latency / lhs_solo;
-                      const double rhs_density = rhs.internalized_bytes -
-                                                 rhs.metrics.latency / rhs_solo;
-                      if (lhs_density != rhs_density) {
-                          return lhs_density > rhs_density;
-                      }
-                      return lhs.metrics.latency < rhs.metrics.latency;
-                  });
-        if (candidates.size() > 8) {
-            candidates.resize(8);
-        }
+        RankAndTrimSeedCandidates(&candidates, runtime.max_candidates_per_start);
 
         if (candidates.empty()) {
             CandidateGroup fallback =
@@ -1785,13 +2350,41 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
 
         if (SeedDebugEnabled()) {
             std::cerr << "seed start " << start << " candidates=" << candidates.size() << "\n";
-            for (const auto& candidate : candidates) {
-                std::cerr << "  ops:";
-                for (size_t op_id : candidate.ops) {
-                    std::cerr << " " << op_id;
+            if (SeedDebugVerboseEnabled()) {
+                for (const auto& candidate : candidates) {
+                    std::cerr << "  ops:";
+                    for (size_t op_id : candidate.ops) {
+                        std::cerr << " " << op_id;
+                    }
+                    std::cerr << " lat=" << candidate.metrics.latency
+                              << " internal=" << candidate.internalized_bytes
+                              << " legality=" << ToString(candidate.legality.failed_level)
+                              << "/" << ToString(candidate.legality.reason) << "\n";
                 }
-                std::cerr << " lat=" << candidate.metrics.latency
-                          << " internal=" << candidate.internalized_bytes << "\n";
+            }
+            std::cerr << "  explored=" << explored_states_by_start[start]
+                      << " accepted=" << accepted_candidates_by_start[start]
+                      << " rejected=" << rejected_candidates_by_start[start] << "\n";
+
+            std::vector<std::pair<size_t, size_t>> reason_counts;
+            for (size_t i = 0; i < reject_reasons_by_start[start].size(); ++i) {
+                const size_t count = reject_reasons_by_start[start][i];
+                if (count > 0) {
+                    reason_counts.push_back({count, i});
+                }
+            }
+            std::sort(reason_counts.begin(), reason_counts.end(),
+                      [](const auto& lhs, const auto& rhs) {
+                          return lhs.first > rhs.first;
+                      });
+            if (!reason_counts.empty()) {
+                std::cerr << "  reject_reasons:";
+                const size_t top_k = std::min<size_t>(3, reason_counts.size());
+                for (size_t i = 0; i < top_k; ++i) {
+                    const auto reason = static_cast<LegalityReason>(reason_counts[i].second);
+                    std::cerr << " " << ToString(reason) << "=" << reason_counts[i].first;
+                }
+                std::cerr << "\n";
             }
         }
     }
@@ -2385,6 +2978,7 @@ std::vector<BitmaskGroup> BuildBitmaskGroups(
     const size_t n = graph.topo_order.size();
     std::vector<BitmaskGroup> result;
     std::unordered_set<uint64_t> seen_masks;
+    size_t partition_cycle_rejects = 0;
 
     for (size_t start = 0; start < n; ++start) {
         for (const auto& cand : candidates[start]) {
@@ -2418,6 +3012,13 @@ std::vector<BitmaskGroup> BuildBitmaskGroups(
                 }
             }
             if (!is_valid_partition) {
+                ++partition_cycle_rejects;
+                if (LegalityDebugEnabled()) {
+                    std::cerr << "  legality_reject(bitmask) start=" << start
+                              << " level=" << ToString(LegalityLevel::kL0Graph)
+                              << " reason=" << ToString(LegalityReason::kPartitionCycle)
+                              << " note=is_fusion_valid_failed\n";
+                }
                 continue;
             }
 
@@ -2427,6 +3028,9 @@ std::vector<BitmaskGroup> BuildBitmaskGroups(
             bg.candidate = cand;
             result.push_back(std::move(bg));
         }
+    }
+    if (LegalityDebugEnabled() && partition_cycle_rejects > 0) {
+        std::cerr << "bitmask rejects PARTITION_CYCLE=" << partition_cycle_rejects << "\n";
     }
     return result;
 }
