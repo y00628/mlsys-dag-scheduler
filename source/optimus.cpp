@@ -62,6 +62,7 @@ enum class LegalityReason {
     kScorerRejected,
     kNoFeasibleGranularity,
     kPartitionCycle,
+    kRuntimeBudgetExceeded,
 };
 
 struct LegalityResult {
@@ -111,6 +112,8 @@ const char* ToString(LegalityReason reason) {
             return "NO_FEASIBLE_GRANULARITY";
         case LegalityReason::kPartitionCycle:
             return "PARTITION_CYCLE";
+        case LegalityReason::kRuntimeBudgetExceeded:
+            return "RUNTIME_BUDGET_EXCEEDED";
     }
     return "UNKNOWN_REASON";
 }
@@ -265,6 +268,7 @@ struct SeedGrowthRuntimeConfig {
     size_t max_frontier = 128;
     size_t max_candidates_per_start = 8;
     size_t total_queue_budget = 50000;
+    size_t max_states_per_seed = 0;
     bool allow_predecessor_growth = true;
     bool allow_successor_growth = true;
     bool require_contiguous_topo = false;
@@ -409,6 +413,8 @@ SeedGrowthRuntimeConfig GetSeedGrowthRuntimeConfig() {
         1, ReadSizeTEnvOrDefault("MLSYS_OPTIMUS_SEED_MAX_CANDIDATES_PER_START", 8));
     config.total_queue_budget = std::max<size_t>(
         1, ReadSizeTEnvOrDefault("MLSYS_OPTIMUS_SEED_TOTAL_QUEUE_BUDGET", 50000));
+    config.max_states_per_seed = ReadSizeTEnvOrDefault(
+        "MLSYS_OPTIMUS_SEED_MAX_STATES_PER_SEED", 0);
     config.allow_predecessor_growth = ReadBoolEnvOrDefault(
         "MLSYS_OPTIMUS_SEED_ALLOW_PRED", true);
     config.allow_successor_growth = ReadBoolEnvOrDefault(
@@ -1948,7 +1954,7 @@ size_t EstimateMaxGroupSize(const Problem& problem) {
 std::vector<std::vector<CandidateGroup>> GenerateCandidates(
     const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
     constexpr size_t kReasonCount =
-        static_cast<size_t>(LegalityReason::kPartitionCycle) + 1;
+        static_cast<size_t>(LegalityReason::kRuntimeBudgetExceeded) + 1;
     const size_t n = graph.topo_order.size();
     const size_t max_group_size = EstimateMaxGroupSize(problem);
     std::vector<std::vector<CandidateGroup>> by_start(n);
@@ -2066,11 +2072,20 @@ std::vector<size_t> CollectGrowthFrontier(
         }
     }
 
+    frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
+
+    // Smart frontier sorting: prioritize nodes that connect to multiple branches
+    // (higher degree = more growth opportunity) then by topo order
     std::sort(frontier.begin(), frontier.end(),
               [&](size_t lhs, size_t rhs) {
+                  const size_t lhs_degree = graph.succs[lhs].size() + graph.preds[lhs].size();
+                  const size_t rhs_degree = graph.succs[rhs].size() + graph.preds[rhs].size();
+                  if (lhs_degree != rhs_degree) {
+                      return lhs_degree > rhs_degree;  // Higher degree first
+                  }
                   return graph.topo_pos[lhs] < graph.topo_pos[rhs];
               });
-    frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
+
     if (frontier.size() > max_frontier) {
         frontier.resize(max_frontier);
     }
@@ -2155,9 +2170,13 @@ void RankAndTrimSeedCandidates(std::vector<CandidateGroup>* candidates,
 std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
     constexpr size_t kReasonCount =
-        static_cast<size_t>(LegalityReason::kScorerRejected) + 1;
+        static_cast<size_t>(LegalityReason::kRuntimeBudgetExceeded) + 1;
     const size_t n = graph.topo_order.size();
     const SeedGrowthRuntimeConfig runtime = GetSeedGrowthRuntimeConfig();
+    const size_t max_states_per_seed =
+        runtime.max_states_per_seed > 0
+            ? runtime.max_states_per_seed
+            : std::min<size_t>(1500, std::max<size_t>(400, n * 20));
     const size_t estimated_group_size = EstimateMaxGroupSize(problem);
     const size_t max_group_size = runtime.max_group_size_override > 0
                                       ? std::min(runtime.max_group_size_override,
@@ -2169,6 +2188,8 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     std::vector<size_t> rejected_candidates_by_start(n, 0);
     std::vector<std::vector<size_t>> reject_reasons_by_start(
         n, std::vector<size_t>(kReasonCount, 0));
+    std::unordered_map<std::vector<size_t>, CandidateGroup, OpVectorHash> candidate_cache;
+    candidate_cache.reserve(std::max<size_t>(1024, runtime.total_queue_budget / 2));
     size_t global_queue_pushes = 0;
 
     for (size_t topo_idx = 0; topo_idx < n; ++topo_idx) {
@@ -2178,6 +2199,10 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
         size_t explored_states = 0;
         size_t accepted_candidates = 0;
         size_t rejected_candidates = 0;
+        double best_latency = std::numeric_limits<double>::max();
+        size_t iterations_without_improvement = 0;
+        constexpr size_t kMaxIterationsWithoutImprovement = 20;  // More aggressive early termination
+
         const std::vector<size_t> seed_ops = CandidateKeyFromOps(
             CanonicalizeOpSet({seed}, graph));
         pending.push(seed_ops);
@@ -2189,8 +2214,50 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
             pending.pop();
             ++explored_states;
 
-            CandidateGroup candidate =
-                BuildBestCandidate(problem, graph, current_ops, config);
+            if (explored_states > max_states_per_seed) {
+                ++rejected_candidates;
+                ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
+                    LegalityReason::kRuntimeBudgetExceeded)];
+                if (LegalityDebugEnabled()) {
+                    std::cerr << "  legality_reject start=" << topo_idx
+                              << " level=" << ToString(LegalityLevel::kL3Policy)
+                              << " reason=" << ToString(LegalityReason::kRuntimeBudgetExceeded)
+                              << " note=seed_state_budget_exceeded\n";
+                }
+                break;
+            }
+
+            // Early termination: if no improvement for many iterations, skip this seed
+            // (likely exhausted high-quality expansion directions)
+            if (iterations_without_improvement > kMaxIterationsWithoutImprovement) {
+                if (LegalityDebugEnabled()) {
+                    std::cerr << "  seed_growth early_termination start=" << topo_idx
+                              << " iterations_no_progress=" << iterations_without_improvement << "\n";
+                }
+                break;
+            }
+
+            CandidateGroup candidate;
+            const auto cached = candidate_cache.find(current_ops);
+            if (cached != candidate_cache.end()) {
+                candidate = cached->second;
+            } else {
+                candidate = BuildBestCandidate(problem, graph, current_ops, config);
+                candidate_cache.emplace(current_ops, candidate);
+            }
+
+            // Track progress: update iteration counter and best latency
+            if (candidate.metrics.valid) {
+                if (candidate.metrics.latency < best_latency) {
+                    best_latency = candidate.metrics.latency;
+                    iterations_without_improvement = 0;  // Reset counter
+                } else {
+                    ++iterations_without_improvement;
+                }
+            } else {
+                ++iterations_without_improvement;
+            }
+
             if (candidate.metrics.valid) {
                 if (runtime.require_contiguous_topo &&
                     !IsContiguousTopoSpan(graph, candidate)) {
