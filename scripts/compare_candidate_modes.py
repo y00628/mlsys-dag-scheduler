@@ -4,8 +4,10 @@ import glob
 import json
 import os
 import re
+import signal
 import subprocess
 import time
+import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -21,6 +23,7 @@ class RunResult:
     seed_starts: int
     empty_seed_starts: int
     avg_candidates_per_start: float
+    timed_out: bool
 
 
 def topo_order(problem: dict) -> List[int]:
@@ -74,7 +77,30 @@ def parse_seed_stats(stderr: str) -> Tuple[int, int, float]:
     return seed_starts, empty, avg
 
 
-def run_one(binary: str, benchmark_path: str, mode: str, out_dir: str) -> RunResult:
+def benchmark_sort_key(path: str) -> Tuple[int, str]:
+    name = os.path.splitext(os.path.basename(path))[0]
+    m = re.search(r"(\d+)$", name)
+    idx = int(m.group(1)) if m else 10**9
+    return (idx, name)
+
+
+def terminate_process_tree(p: subprocess.Popen) -> None:
+    if p.poll() is not None:
+        return
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_one(binary: str, benchmark_path: str, mode: str, out_dir: str, timeout_sec: float) -> RunResult:
     bench_name = os.path.splitext(os.path.basename(benchmark_path))[0]
     out_path = os.path.join(out_dir, f"{bench_name}_{mode}.json")
 
@@ -83,27 +109,64 @@ def run_one(binary: str, benchmark_path: str, mode: str, out_dir: str) -> RunRes
     if mode == "interval":
         env["MLSYS_OPTIMUS_CANDIDATES"] = "interval"
         env["MLSYS_OPTIMUS_DEBUG_SEED"] = "0"
+    elif mode == "seed_growth_old":
+        env["MLSYS_OPTIMUS_CANDIDATES"] = "seed_growth"
+        env["MLSYS_OPTIMUS_DEBUG_SEED"] = "1"
+        env["MLSYS_OPTIMUS_SEED_ALLOW_PRED"] = "0"
+        env["MLSYS_OPTIMUS_SEED_ALLOW_SUCC"] = "1"
+        env["MLSYS_OPTIMUS_SEED_REQUIRE_CONTIGUOUS"] = "1"
     else:
         env["MLSYS_OPTIMUS_CANDIDATES"] = "seed_growth"
         env["MLSYS_OPTIMUS_DEBUG_SEED"] = "1"
+        env["MLSYS_OPTIMUS_SEED_ALLOW_PRED"] = "1"
+        env["MLSYS_OPTIMUS_SEED_ALLOW_SUCC"] = "1"
+        env["MLSYS_OPTIMUS_SEED_REQUIRE_CONTIGUOUS"] = "0"
 
     t0 = time.perf_counter()
-    proc = subprocess.run(
-        [binary, benchmark_path, out_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        check=False,
-    )
-    t1 = time.perf_counter()
+    timed_out = False
+    stderr_text = ""
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False, encoding="utf-8") as errf:
+        err_path = errf.name
 
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Run failed for {bench_name} [{mode}]\n"
-            f"stdout:\n{proc.stdout}\n"
-            f"stderr:\n{proc.stderr}\n"
+    with open(err_path, "w", encoding="utf-8") as err_stream:
+        p = subprocess.Popen(
+            [binary, benchmark_path, out_path],
+            stdout=subprocess.DEVNULL,
+            stderr=err_stream,
+            text=True,
+            env=env,
+            start_new_session=True,
         )
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            rc = p.poll()
+            if rc is not None:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                terminate_process_tree(p)
+                break
+            time.sleep(0.1)
+
+    with open(err_path, "r", encoding="utf-8", errors="ignore") as f:
+        stderr_text = f.read()
+    try:
+        os.remove(err_path)
+    except OSError:
+        pass
+
+    if timed_out:
+        raise RuntimeError(
+            f"Run timed out for {bench_name} [{mode}] after {timeout_sec}s\n"
+            f"stderr(partial tail):\n{stderr_text[-4000:]}\n"
+        )
+
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"Run failed for {bench_name} [{mode}] returncode={p.returncode}\n"
+            f"stderr tail:\n{stderr_text[-4000:]}\n"
+        )
+    t1 = time.perf_counter()
 
     with open(out_path, "r", encoding="utf-8") as f:
         sol = json.load(f)
@@ -118,7 +181,7 @@ def run_one(binary: str, benchmark_path: str, mode: str, out_dir: str) -> RunRes
     non_contiguous = sum(1 for sg in subgraphs if not is_contiguous_in_topo(sg, topo_pos))
     ratio = non_contiguous / max(1, len(subgraphs))
 
-    seed_starts, empty_seed_starts, avg_candidates = parse_seed_stats(proc.stderr)
+    seed_starts, empty_seed_starts, avg_candidates = parse_seed_stats(stderr_text)
 
     return RunResult(
         benchmark=bench_name,
@@ -130,12 +193,13 @@ def run_one(binary: str, benchmark_path: str, mode: str, out_dir: str) -> RunRes
         seed_starts=seed_starts,
         empty_seed_starts=empty_seed_starts,
         avg_candidates_per_start=avg_candidates,
+        timed_out=timed_out,
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare optimus candidate modes (interval vs seed-growth) on released benchmarks."
+        description="Compare optimus candidate modes (interval vs seed-growth-old vs seed-growth) on released benchmarks."
     )
     parser.add_argument(
         "--binary",
@@ -145,7 +209,7 @@ def main():
     parser.add_argument(
         "--benchmarks",
         nargs="*",
-        default=sorted(glob.glob("MLSys/benchmarks/*.json")),
+        default=sorted(glob.glob("MLSys/benchmarks/*.json"), key=benchmark_sort_key),
         help="Benchmark JSON paths (default: all MLSys/benchmarks/*.json)",
     )
     parser.add_argument(
@@ -153,15 +217,43 @@ def main():
         default="outputs/mode_compare",
         help="Output directory for generated solutions",
     )
+    parser.add_argument(
+        "--timeout-sec",
+        type=float,
+        default=90.0,
+        help="Per-run timeout in seconds (default: 90)",
+    )
+    parser.add_argument(
+        "--max-benchmarks",
+        type=int,
+        default=0,
+        help="Limit number of benchmarks (0 means all)",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue remaining runs when one run fails/times out",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    modes = ["interval", "seed_growth"]
+    modes = ["interval", "seed_growth_old", "seed_growth"]
+    benches = args.benchmarks
+    if args.max_benchmarks > 0:
+        benches = benches[: args.max_benchmarks]
+
     results: List[RunResult] = []
-    for bench in args.benchmarks:
+    for bench in benches:
         for mode in modes:
-            results.append(run_one(args.binary, bench, mode, args.out_dir))
+            print(f"[run] {os.path.basename(bench)} mode={mode}", flush=True)
+            try:
+                results.append(run_one(args.binary, bench, mode, args.out_dir, args.timeout_sec))
+            except Exception as e:
+                if args.continue_on_error:
+                    print(f"[warn] {e}", flush=True)
+                    continue
+                raise
 
     print("\n# Mode comparison summary\n")
     print(
@@ -179,13 +271,47 @@ def main():
     print("\n# Aggregate by mode\n")
     for mode in modes:
         subset = [r for r in results if r.mode == mode]
+        if not subset:
+            print(f"{mode}: no successful runs")
+            continue
         avg_wall = sum(r.wall_time_sec for r in subset) / max(1, len(subset))
         avg_lat = sum(r.total_latency for r in subset) / max(1, len(subset))
         avg_non_contig = sum(r.selected_non_contiguous_ratio for r in subset) / max(1, len(subset))
         avg_empty = sum(r.empty_seed_starts for r in subset) / max(1, len(subset))
         print(
             f"{mode}: avg_wall={avg_wall:.4f}s, avg_latency={avg_lat:.1f}, "
-            f"avg_non_contig_ratio={avg_non_contig:.3f}, avg_empty_seed_starts={avg_empty:.2f}"
+            f"avg_non_contig_ratio={avg_non_contig:.3f}, avg_empty_seed_starts={avg_empty:.2f}, "
+            f"successful_runs={len(subset)}/{len(benches)}"
+        )
+
+    # Pass/fail hints for Phase-1 checklist.
+    by_mode = {m: [r for r in results if r.mode == m] for m in modes}
+    interval_complete = len(by_mode["interval"]) == len(benches) and len(benches) > 0
+    seed_complete = len(by_mode["seed_growth"]) == len(benches) and len(benches) > 0
+    interval_non_contig = sum(r.selected_non_contiguous_ratio for r in by_mode["interval"]) / max(1, len(by_mode["interval"]))
+    seed_non_contig = sum(r.selected_non_contiguous_ratio for r in by_mode["seed_growth"]) / max(1, len(by_mode["seed_growth"]))
+    seed_empty_ok = seed_complete and all(r.empty_seed_starts == 0 for r in by_mode["seed_growth"])
+
+    print("\n# Phase-1 checklist hints\n")
+    if not seed_complete:
+        print(
+            "no_empty_seed_starts(seed_growth): INCONCLUSIVE "
+            f"(successful_runs={len(by_mode['seed_growth'])}/{len(benches)})"
+        )
+    else:
+        print(f"no_empty_seed_starts(seed_growth): {'PASS' if seed_empty_ok else 'FAIL'}")
+
+    if not (seed_complete and interval_complete):
+        print(
+            "candidate_diversity_improved(seed_growth vs interval): INCONCLUSIVE "
+            f"(seed_runs={len(by_mode['seed_growth'])}/{len(benches)}, "
+            f"interval_runs={len(by_mode['interval'])}/{len(benches)})"
+        )
+    else:
+        print(
+            "candidate_diversity_improved(seed_growth vs interval): "
+            f"{'PASS' if seed_non_contig > interval_non_contig else 'FAIL'} "
+            f"(seed={seed_non_contig:.3f}, interval={interval_non_contig:.3f})"
         )
 
 

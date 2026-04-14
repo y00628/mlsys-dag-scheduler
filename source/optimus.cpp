@@ -260,6 +260,7 @@ struct SeedGrowthRuntimeConfig {
     size_t total_queue_budget = 50000;
     bool allow_predecessor_growth = true;
     bool allow_successor_growth = true;
+    bool require_contiguous_topo = false;
 };
 
 std::unordered_map<ScoreCacheKey, GroupMetrics, ScoreCacheKeyHash> g_score_cache;
@@ -345,6 +346,11 @@ bool SeedDebugEnabled() {
     return raw != nullptr && std::string(raw) == "1";
 }
 
+bool SeedDebugVerboseEnabled() {
+    const char* raw = std::getenv("MLSYS_OPTIMUS_DEBUG_SEED_VERBOSE");
+    return raw != nullptr && std::string(raw) == "1";
+}
+
 size_t ReadSizeTEnvOrDefault(const char* name, size_t default_value) {
     const char* raw = std::getenv(name);
     if (raw == nullptr) {
@@ -389,6 +395,8 @@ SeedGrowthRuntimeConfig GetSeedGrowthRuntimeConfig() {
         "MLSYS_OPTIMUS_SEED_ALLOW_PRED", true);
     config.allow_successor_growth = ReadBoolEnvOrDefault(
         "MLSYS_OPTIMUS_SEED_ALLOW_SUCC", true);
+    config.require_contiguous_topo = ReadBoolEnvOrDefault(
+        "MLSYS_OPTIMUS_SEED_REQUIRE_CONTIGUOUS", false);
     if (!config.allow_predecessor_growth && !config.allow_successor_growth) {
         config.allow_successor_growth = true;
     }
@@ -1920,6 +1928,21 @@ std::vector<size_t> CollectGrowthFrontier(
     return frontier;
 }
 
+bool IsContiguousTopoSpan(const OpGraph& graph, const CandidateGroup& candidate) {
+    if (candidate.ops.empty()) {
+        return false;
+    }
+    if (candidate.ops.size() != candidate.end - candidate.start + 1) {
+        return false;
+    }
+    for (size_t i = 0; i < candidate.ops.size(); ++i) {
+        if (candidate.ops[i] != graph.topo_order[candidate.start + i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool PassSeedPolicyFilter(const CandidateGroup& candidate,
                           const Problem& problem) {
     if (candidate.ops.size() <= 1) {
@@ -1982,6 +2005,8 @@ void RankAndTrimSeedCandidates(std::vector<CandidateGroup>* candidates,
 
 std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
+    constexpr size_t kReasonCount =
+        static_cast<size_t>(LegalityReason::kScorerRejected) + 1;
     const size_t n = graph.topo_order.size();
     const SeedGrowthRuntimeConfig runtime = GetSeedGrowthRuntimeConfig();
     const size_t estimated_group_size = EstimateMaxGroupSize(problem);
@@ -1993,6 +2018,8 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     std::vector<size_t> explored_states_by_start(n, 0);
     std::vector<size_t> accepted_candidates_by_start(n, 0);
     std::vector<size_t> rejected_candidates_by_start(n, 0);
+    std::vector<std::vector<size_t>> reject_reasons_by_start(
+        n, std::vector<size_t>(kReasonCount, 0));
     size_t global_queue_pushes = 0;
 
     for (size_t topo_idx = 0; topo_idx < n; ++topo_idx) {
@@ -2016,14 +2043,31 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
             CandidateGroup candidate =
                 BuildBestCandidate(problem, graph, current_ops, config);
             if (candidate.metrics.valid) {
+                if (runtime.require_contiguous_topo &&
+                    !IsContiguousTopoSpan(graph, candidate)) {
+                    candidate.legality.is_valid = false;
+                    candidate.legality.failed_level = LegalityLevel::kL3Policy;
+                    candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
+                    ++rejected_candidates;
+                    ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
+                        candidate.legality.reason)];
+                    continue;
+                }
                 if (PassSeedPolicyFilter(candidate, problem)) {
                     by_start[candidate.start].push_back(candidate);
                     ++accepted_candidates;
                 } else {
+                    candidate.legality.is_valid = false;
+                    candidate.legality.failed_level = LegalityLevel::kL3Policy;
+                    candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
                     ++rejected_candidates;
+                    ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
+                        candidate.legality.reason)];
                 }
             } else {
                 ++rejected_candidates;
+                ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
+                    candidate.legality.reason)];
             }
 
             if (current_ops.size() >= max_group_size) {
@@ -2068,19 +2112,42 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
 
         if (SeedDebugEnabled()) {
             std::cerr << "seed start " << start << " candidates=" << candidates.size() << "\n";
-            for (const auto& candidate : candidates) {
-                std::cerr << "  ops:";
-                for (size_t op_id : candidate.ops) {
-                    std::cerr << " " << op_id;
+            if (SeedDebugVerboseEnabled()) {
+                for (const auto& candidate : candidates) {
+                    std::cerr << "  ops:";
+                    for (size_t op_id : candidate.ops) {
+                        std::cerr << " " << op_id;
+                    }
+                    std::cerr << " lat=" << candidate.metrics.latency
+                              << " internal=" << candidate.internalized_bytes
+                              << " legality=" << ToString(candidate.legality.failed_level)
+                              << "/" << ToString(candidate.legality.reason) << "\n";
                 }
-                std::cerr << " lat=" << candidate.metrics.latency
-                          << " internal=" << candidate.internalized_bytes
-                          << " legality=" << ToString(candidate.legality.failed_level)
-                          << "/" << ToString(candidate.legality.reason) << "\n";
             }
             std::cerr << "  explored=" << explored_states_by_start[start]
                       << " accepted=" << accepted_candidates_by_start[start]
                       << " rejected=" << rejected_candidates_by_start[start] << "\n";
+
+            std::vector<std::pair<size_t, size_t>> reason_counts;
+            for (size_t i = 0; i < reject_reasons_by_start[start].size(); ++i) {
+                const size_t count = reject_reasons_by_start[start][i];
+                if (count > 0) {
+                    reason_counts.push_back({count, i});
+                }
+            }
+            std::sort(reason_counts.begin(), reason_counts.end(),
+                      [](const auto& lhs, const auto& rhs) {
+                          return lhs.first > rhs.first;
+                      });
+            if (!reason_counts.empty()) {
+                std::cerr << "  reject_reasons:";
+                const size_t top_k = std::min<size_t>(3, reason_counts.size());
+                for (size_t i = 0; i < top_k; ++i) {
+                    const auto reason = static_cast<LegalityReason>(reason_counts[i].second);
+                    std::cerr << " " << ToString(reason) << "=" << reason_counts[i].first;
+                }
+                std::cerr << "\n";
+            }
         }
     }
 

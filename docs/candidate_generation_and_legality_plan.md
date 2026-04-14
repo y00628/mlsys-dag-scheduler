@@ -6,8 +6,8 @@
 ## 1) Scope from checklist
 
 ### Candidate Group Generation
-- [ ] Make **DAG-aware seed growth** the main path
-- [ ] Support **general DAG groups** (not only linear/contiguous patterns)
+- [x] Make **DAG-aware seed growth** the main path
+- [x] Support **general DAG groups** (not only linear/contiguous patterns)
 
 ### Valid Fused Group Checking
 - [ ] Move legality closer to paper-style **execution-validity**
@@ -79,13 +79,15 @@ Suggested reason codes:
 
 ### Tasks
 - [x] Promote seed-growth to default candidate generation path
-- [ ] Implement expansion operators:
+- [x] Implement expansion operators:
   - [x] forward successor expansion
   - [x] backward predecessor expansion
   - [x] bidirectional expansion for branch/diamond structures
 - [ ] Maintain boundary/internal tensor sets incrementally during growth
+  - blocker: boundary/internal tensor tracking is still recomputed per candidate path; no incremental delta-update state is wired yet.
 - [x] Canonicalization + de-dup key
 - [ ] Add dominance/rank-based pruning and hard runtime budgets
+  - blocker: ranking/policy pruning and budgets exist, but seed-growth still times out on larger released benchmarks (e.g., 9/13/17 with 60s cap), so bounded-runtime criterion is not yet met.
 
 ### Implemented notes (current)
 - Seed-growth is now default when `MLSYS_OPTIMUS_CANDIDATES` is unset.
@@ -132,7 +134,7 @@ Suggested reason codes:
 
 #### P1-4. Canonicalization and dedup robustness
 - [x] Replace `std::set<std::vector<size_t>> seen` usage with canonical key helper to reduce overhead.
-- [ ] Add helper function:
+- [x] Add helper function:
   - [x] `CanonicalizeOpSet(const std::vector<size_t>& ops, const OpGraph& graph)`
   - [x] `CandidateKeyFromOps(const std::vector<size_t>& canonical_ops)`
 - [x] Keep final dedup by `candidate.ops`, but ensure only canonicalized forms enter queue.
@@ -195,10 +197,13 @@ Implemented:
 - [ ] Compare three modes:
   - [x] interval vs seed-growth(current)
   - [ ] seed-growth(old) baseline (requires historical commit / snapshot run)
+    - blocker: old seed-growth numbers are not yet reproduced from a pinned historical commit/snapshot in the current workspace runbook.
 - [ ] Pass criteria:
   - [ ] no empty-start candidate buckets
+    - blocker: currently only verified on successful runs; full released-benchmark verification is incomplete because several seed-growth runs time out.
   - [x] no crash / no infinite queue growth (guarded by queue budget + successful runs)
   - [ ] candidate diversity improved with bounded runtime (pending benchmark report)
+    - blocker: diversity improvement appears on completed subsets, but bounded-runtime is not satisfied across all released benchmarks due to seed-growth timeouts.
 
 #### P1-10. Suggested commit slicing (for clean review)
 - [ ] Commit A: mode default + env knobs
