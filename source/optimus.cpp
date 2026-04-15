@@ -1248,10 +1248,34 @@ std::vector<int64_t> BuildSpatialCandidates(int64_t dim, int64_t native_dim) {
     values.insert(safe_dim);
 
     for (int64_t divisor : {1LL, 2LL, 4LL, 8LL, 16LL}) {
-        values.insert(std::max<int64_t>(1, std::min(safe_dim, safe_native / divisor)));
+        values.insert(std::max<int64_t>(1, std::min(safe_dim, safe_native / divisor))); 
     }
     for (int64_t tiles : {1LL, 2LL, 4LL, 8LL, 16LL, 32LL}) {
         values.insert(std::max<int64_t>(1, CeilDivInt(safe_dim, tiles)));
+    }
+    // Small multiples of native granularity (2x through 8x).
+    // The existing loops above only produce native/power-of-2 and ceil(dim/power-of-2),
+    // which misses hardware-aligned intermediate sizes. For example, with native=128
+    // and dim=2048, the loops above give {8,16,32,64,128,256,512,1024,2048} but miss
+    // 384 (3×128), 640 (5×128), 768 (6×128), 896 (7×128). These intermediate sizes
+    // can be optimal when capacity constraints are tight — they give more tiles than
+    // 256 but fewer than 128, hitting a sweet spot between parallelism and memory.
+    for (int64_t mult = 2; mult <= 8; ++mult) {
+        const int64_t v = mult * safe_native;
+        if (v <= safe_dim) {
+            values.insert(v);
+        }
+    }
+    // Divisor-friendly multiples: values where dim % v == 0, meaning every tile is
+    // exactly the same size (no smaller "edge" tile at the boundary). This eliminates
+    // edge tile waste entirely and gives the most uniform workload distribution.
+    // E.g., for dim=2048, native=128: 384 doesn't divide 2048, but 256 (2×128) and
+    // 512 (4×128) do, so those get added here (if not already present).
+    for (int64_t mult : {2LL, 3LL, 4LL, 5LL, 6LL, 7LL, 8LL, 10LL, 12LL, 16LL}) {
+        const int64_t v = mult * safe_native;
+        if (v > 0 && v <= safe_dim && safe_dim % v == 0) {
+            values.insert(v);
+        }
     }
 
     std::vector<int64_t> result(values.begin(), values.end());
@@ -1439,24 +1463,69 @@ double EstimateProxyLatency(const Problem& problem, const OpGraph& graph,
         }
     }
 
-    // Proxy: compute interior tile latency and multiply by tile count.
-    // Interior tile has actual_h = granularity.height, actual_w = granularity.width.
-    // This is O(k_steps) instead of O(tiles_h * tiles_w * k_steps).
-    const int64_t actual_h = std::min<int64_t>(granularity.height, ref_out.height);
-    const int64_t actual_w = std::min<int64_t>(granularity.width, ref_out.width);
-    double tile_latency = 0.0;
-    for (int64_t step_index = 0; step_index < max_k_steps; ++step_index) {
-        const StepEstimate estimate = EstimateStep(
-            problem, graph, ops, boundary, granularity, actual_h,
-            actual_w, step_index, max_k_steps);
-        const double proxy_memory =
-            (static_cast<double>(estimate.active_bytes) +
-             static_cast<double>(estimate.output_write_bytes)) /
-            static_cast<double>(problem.slow_memory_bandwidth);
-        tile_latency += std::max(estimate.compute_cost, proxy_memory);
+    // Edge-aware proxy: instead of assuming all tiles are the same size (interior),
+    // we separate tiles into up to 4 categories based on position:
+    //
+    //   +------------------+-----+
+    //   |                  |     |
+    //   |   interior tiles | right-edge tiles
+    //   |   (full_h×full_w)|     | (full_h × rem_w)
+    //   |                  |     |
+    //   +------------------+-----+
+    //   | bottom-edge tiles|corner|
+    //   | (rem_h × full_w) |(rem_h × rem_w)
+    //   +------------------+-----+
+    //
+    // When granularity doesn't evenly divide the output tensor, the last row/column
+    // of tiles are smaller. The old proxy multiplied interior cost by total tile count,
+    // which overestimates latency for non-divisor tile sizes and biases against them.
+    // This 4-category model is still O(4 × k_steps) — much faster than the evaluator's
+    // O(tiles_h × tiles_w × k_steps) full simulation.
+    const int64_t full_h = std::min<int64_t>(granularity.height, ref_out.height);
+    const int64_t full_w = std::min<int64_t>(granularity.width, ref_out.width);
+    const int64_t rem_h = ref_out.height % granularity.height;
+    const int64_t rem_w = ref_out.width % granularity.width;
+    const bool has_edge_h = (rem_h != 0 && tiles_h > 1);
+    const bool has_edge_w = (rem_w != 0 && tiles_w > 1);
+
+    // Compute total latency for one tile with given actual dimensions (ah × aw).
+    // Sums roofline cost max(compute, memory) across all k-steps.
+    auto compute_tile_latency = [&](int64_t ah, int64_t aw) -> double {
+        double lat = 0.0;
+        for (int64_t step = 0; step < max_k_steps; ++step) {
+            const StepEstimate est = EstimateStep(
+                problem, graph, ops, boundary, granularity, ah, aw,
+                step, max_k_steps);
+            const double mem =
+                (static_cast<double>(est.active_bytes) +
+                 static_cast<double>(est.output_write_bytes)) /
+                static_cast<double>(problem.slow_memory_bandwidth);
+            lat += std::max(est.compute_cost, mem);
+        }
+        return lat;
+    };
+
+    // Count tiles in each category and sum their costs.
+    const int64_t interior_h = tiles_h - (has_edge_h ? 1 : 0);
+    const int64_t interior_w = tiles_w - (has_edge_w ? 1 : 0);
+    double total = compute_tile_latency(full_h, full_w) *
+                   static_cast<double>(interior_h * interior_w);
+    if (has_edge_w) {
+        // Right-edge column: full height but reduced width (rem_w).
+        total += compute_tile_latency(full_h, rem_w) *
+                 static_cast<double>(interior_h);
+    }
+    if (has_edge_h) {
+        // Bottom-edge row: reduced height (rem_h) but full width.
+        total += compute_tile_latency(rem_h, full_w) *
+                 static_cast<double>(interior_w);
+    }
+    if (has_edge_h && has_edge_w) {
+        // Corner tile: reduced in both dimensions. At most 1.
+        total += compute_tile_latency(rem_h, rem_w);
     }
 
-    return tile_latency * static_cast<double>(tiles_h * tiles_w);
+    return total;
 }
 
 bool EvaluateWithOfficialScorer(const Problem& problem,
@@ -1611,6 +1680,55 @@ bool RunStaticLegalityChecks(const Problem& problem, const OpGraph& graph,
     return true;
 }
 
+// Decide how many proxy-ranked candidates to evaluate with the expensive official
+// scorer. The proxy (fast, O(k_steps)) ranks ~450 candidates, but the evaluator
+// (slow, O(tiles×k_steps) with LRU simulation) can only afford to score a few.
+//
+// The old fixed budget of 6 means only the top 1.3% get scored. If the proxy
+// disagrees with the evaluator on ranking (common for multi-op fusion groups with
+// complex memory patterns), the true best tile might be ranked 8th or 12th by
+// proxy and never evaluated.
+//
+// This function adapts the budget based on two signals:
+//   1. Group complexity: more ops = more proxy-evaluator divergence, so score more.
+//   2. Score clustering: if many candidates have similar proxy scores (within 10%
+//      of the best), the proxy can't distinguish them reliably, so let the
+//      evaluator break the tie.
+//
+// Returns a budget in [6, 20], capped by the number of available candidates.
+size_t ComputeRefineBudget(
+    const std::vector<std::pair<double, Granularity>>& proxy_ranked,
+    size_t num_ops) {
+    constexpr size_t kMinBudget = 6;
+    constexpr size_t kMaxBudget = 20;
+
+    if (proxy_ranked.size() <= kMinBudget) {
+        return proxy_ranked.size();
+    }
+
+    // Base budget scales with group complexity.
+    size_t budget = kMinBudget;
+    if (num_ops >= 2) budget += 2;  // 2-3 ops: budget = 8
+    if (num_ops >= 4) budget += 2;  // 4+ ops:  budget = 10
+
+    // Expand budget to cover the "ambiguous zone" where proxy scores are close.
+    // proxy_ranked is already sorted ascending, so [0] is the best proxy score.
+    if (proxy_ranked.size() >= 2) {
+        const double threshold = proxy_ranked[0].first * 1.10;  // 10% window
+        size_t similar = 0;
+        for (const auto& [score, _] : proxy_ranked) {
+            if (score <= threshold) {
+                ++similar;
+            } else {
+                break;  // sorted, so all remaining are worse
+            }
+        }
+        budget = std::max(budget, std::min(similar, kMaxBudget));
+    }
+
+    return std::min(budget, proxy_ranked.size());
+}
+
 CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
                                   const std::vector<size_t>& input_ops,
                                   const OptimusConfig& config) {
@@ -1720,7 +1838,7 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         return candidate;
     }
 
-    const size_t budget = std::min(kGranularityRefineBudget, proxy_ranked.size());
+    const size_t budget = ComputeRefineBudget(proxy_ranked, candidate.ops.size());
     for (size_t i = 0; i < budget; ++i) {
         GroupMetrics metrics = EvaluateGroup(problem, graph, candidate.ops,
                                              candidate.boundary,
@@ -1736,7 +1854,6 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
             candidate.legality.level_passed = LegalityLevel::kL3Policy;
             candidate.legality.reason = LegalityReason::kNone;
             candidate.legality.failed_level = LegalityLevel::kL0Graph;
-            candidate.debug_tags = {"best_granularity_selected"};
         }
     }
 
@@ -1897,11 +2014,12 @@ CandidateGroup BuildBestCandidateWithScheduler(
     }
 
     // --- Evaluate top candidates with official scorer ------------------------
-    const size_t budget = std::min(kGranularityRefineBudget, proxy_ranked.size());
+    const size_t budget = ComputeRefineBudget(proxy_ranked, candidate.ops.size());
     for (size_t i = 0; i < budget; ++i) {
         GroupMetrics metrics = EvaluateGroup(problem, graph, candidate.ops,
                                              candidate.boundary,
-                                             proxy_ranked[i].second);
+                                             proxy_ranked[i].second,
+                                             nullptr);
         if (!metrics.valid) {
             continue;
         }
@@ -2909,13 +3027,24 @@ void AddAnalyticalTileCandidates(const Problem& problem,
 
     const TileBufferCoeffs coeffs = ComputeBufferCoeffs(problem, graph, ops, boundary);
 
-    // Try natural aspect ratio and 1:1
-    std::vector<double> ratios;
-    ratios.push_back(static_cast<double>(out_h) / static_cast<double>(out_w));
+    // Build aspect ratios: natural, 1:1, inverse, plus intermediates.
+    const double natural = static_cast<double>(out_h) / static_cast<double>(out_w);
+    const double inverse = static_cast<double>(out_w) / static_cast<double>(out_h);
+    std::vector<double> ratios = {natural};
     if (out_h != out_w) {
         ratios.push_back(1.0);
     }
-    ratios.push_back(static_cast<double>(out_w) / static_cast<double>(out_h));
+    ratios.push_back(inverse);
+    for (double r : {0.25, 0.5, 2.0, 4.0}) {
+        ratios.push_back(r);
+    }
+    if (natural > 0.0) ratios.push_back(std::sqrt(natural));
+    if (inverse > 0.0) ratios.push_back(std::sqrt(inverse));
+    // Deduplicate ratios.
+    std::sort(ratios.begin(), ratios.end());
+    ratios.erase(std::unique(ratios.begin(), ratios.end(),
+        [](double a, double b) { return std::abs(a - b) < 1e-9; }),
+        ratios.end());
 
     for (int64_t k_step : k_steps) {
         if (k_step <= 0) {
@@ -2939,12 +3068,28 @@ void AddAnalyticalTileCandidates(const Problem& problem,
             tile_w = std::max<int64_t>(1, tile_w);
 
             Granularity g{tile_w, tile_h, k_step};
-            // Verify the working set fits (proxy check)
+            // Binary search for largest fitting tile_w when initial guess overflows.
             int64_t ws = EstimateWorkingSetBytes(problem, graph, ops, boundary, g);
             if (ws > problem.fast_memory_capacity) {
-                // Halve and retry
-                tile_w = std::max<int64_t>(1, tile_w / 2);
-                tile_h = std::max<int64_t>(1, tile_h / 2);
+                int64_t lo = 1, hi = tile_w;
+                while (lo < hi) {
+                    const int64_t mid = lo + (hi - lo + 1) / 2;
+                    const int64_t th = std::max<int64_t>(1,
+                        std::min<int64_t>(out_h,
+                            static_cast<int64_t>(r * static_cast<double>(mid))));
+                    const Granularity test_g{mid, th, k_step};
+                    if (EstimateWorkingSetBytes(problem, graph, ops, boundary,
+                                                test_g) <=
+                        problem.fast_memory_capacity) {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                tile_w = lo;
+                tile_h = std::max<int64_t>(1,
+                    std::min<int64_t>(out_h,
+                        static_cast<int64_t>(r * static_cast<double>(tile_w))));
                 g = {tile_w, tile_h, k_step};
                 ws = EstimateWorkingSetBytes(problem, graph, ops, boundary, g);
                 if (ws > problem.fast_memory_capacity) {
