@@ -1,0 +1,10 @@
+Loaded problem from: benchmarks/mlsys-2026-1.json
+Problem: 9 tensors, 5 ops, fast_mem=60000, slow_bw=20
+Solver backend: optimus_paper
+Optimus paper: N=5
+Optimus paper: seed-growth candidates (non-contig allowed)
+Optimus paper: 14 bitmask groups
+Optimus paper bitmask DP cost: 405875
+Solution: 2 subgraphs, 5/5 ops covered
+Solution written to: outputs/mlsys-2026-1_solution.json
+Total latency: 405875

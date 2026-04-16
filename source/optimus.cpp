@@ -173,6 +173,10 @@ struct OptimusConfig {
     // Scheduler integration settings
     double scheduler_cost_weight = 0.0;       // Blended cost: (1-w)*evaluator + w*scheduler
     bool scheduler_propose_granularity = false; // Inject scheduler-proposed granularities
+    // When true, the seed-growth generator keeps non-topologically-contiguous
+    // candidates and files them under the seed's topo-position (not
+    // candidate.start). Required for the bitmask/frontier set-cover DP.
+    bool allow_noncontig_groups = false;
 };
 
 struct ConvGuidanceMetrics {
@@ -432,7 +436,7 @@ LegalityPolicyConfig GetLegalityPolicyConfig() {
     config.enable_l3_policy = ReadBoolEnvOrDefault(
         "MLSYS_OPTIMUS_LEGALITY_ENABLE_L3", true);
     config.enforce_common_output_shape = ReadBoolEnvOrDefault(
-        "MLSYS_OPTIMUS_LEGALITY_ENFORCE_COMMON_OUTPUT_SHAPE", true);
+        "MLSYS_OPTIMUS_LEGALITY_ENFORCE_COMMON_OUTPUT_SHAPE", false);
     config.enforce_internalized_multi_op = ReadBoolEnvOrDefault(
         "MLSYS_OPTIMUS_LEGALITY_ENFORCE_INTERNALIZED_MULTI_OP", true);
     return config;
@@ -1867,6 +1871,20 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         }
     }
 
+    if (std::getenv("MLSYS_OPTIMUS_DEBUG_TILE")) {
+        std::cerr << "[cand] ops=[";
+        for (size_t i = 0; i < candidate.ops.size(); ++i) {
+            std::cerr << (i ? "," : "") << candidate.ops[i];
+        }
+        std::cerr << "] n_tiles=" << proxy_ranked.size()
+                  << " valid=" << (candidate.metrics.valid ? 1 : 0)
+                  << " gran=" << candidate.granularity.width << "x"
+                  << candidate.granularity.height << "x"
+                  << candidate.granularity.depth
+                  << " lat=" << candidate.metrics.latency
+                  << " reason=" << ToString(candidate.legality.reason) << "\n";
+    }
+
     return candidate;
 }
 
@@ -2099,9 +2117,10 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
             }
 
             if (candidate.ops.size() > 1) {
-                const int64_t min_gain =
-                    std::max<int64_t>(1, problem.native_granularity.width) *
-                    std::max<int64_t>(1, problem.native_granularity.height);
+                // Require at least 1 internalized element for multi-op
+                // candidates.  The old threshold (native_w * native_h) was
+                // far too conservative and rejected most fusion groups.
+                constexpr int64_t min_gain = 1;
                 if (candidate.internalized_bytes < min_gain) {
                     candidate.legality.is_valid = false;
                     candidate.legality.level_passed = LegalityLevel::kL1Execution;
@@ -2290,7 +2309,15 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     constexpr size_t kReasonCount =
         static_cast<size_t>(LegalityReason::kRuntimeBudgetExceeded) + 1;
     const size_t n = graph.topo_order.size();
-    const SeedGrowthRuntimeConfig runtime = GetSeedGrowthRuntimeConfig();
+    SeedGrowthRuntimeConfig runtime = GetSeedGrowthRuntimeConfig();
+    // The bitmask/frontier DP handles non-contiguous groups correctly, so the
+    // contiguous-span filter must be disabled when the caller opts in via
+    // config.allow_noncontig_groups. Without this override, every
+    // non-contiguous candidate is rejected at L3 (note=contiguous_required)
+    // before the set-cover DP ever sees it.
+    if (config.allow_noncontig_groups) {
+        runtime.require_contiguous_topo = false;
+    }
     const size_t max_states_per_seed =
         runtime.max_states_per_seed > 0
             ? runtime.max_states_per_seed
@@ -2309,6 +2336,18 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     std::unordered_map<std::vector<size_t>, CandidateGroup, OpVectorHash> candidate_cache;
     candidate_cache.reserve(std::max<size_t>(1024, runtime.total_queue_budget / 2));
     size_t global_queue_pushes = 0;
+
+    // Pre-generate singleton candidates for ALL topo positions.
+    // This guarantees full coverage: even if seed-growth doesn't produce
+    // any candidate starting at a given position, the DP can always fall
+    // back to the singleton.
+    for (size_t pos = 0; pos < n; ++pos) {
+        CandidateGroup singleton =
+            BuildBestCandidate(problem, graph, {graph.topo_order[pos]}, config);
+        if (singleton.metrics.valid) {
+            by_start[pos].push_back(std::move(singleton));
+        }
+    }
 
     for (size_t topo_idx = 0; topo_idx < n; ++topo_idx) {
         const size_t seed = graph.topo_order[topo_idx];
@@ -2396,7 +2435,23 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
                     continue;
                 }
                 if (PassSeedPolicyFilter(candidate, problem)) {
-                    by_start[candidate.start].push_back(candidate);
+                    // When allow_noncontig_groups is set, keep every accepted
+                    // candidate (contiguous or not) and file it under the
+                    // seed's topo-position so the set-cover DP can pick it up
+                    // at the canonical smallest-topo-position. Otherwise only
+                    // keep contiguous candidates because the position-indexed
+                    // DP assumes next_start = candidate.end + 1 and would
+                    // skip uncovered ops between start and end.
+                    const bool is_contiguous =
+                        (static_cast<size_t>(candidate.end - candidate.start + 1) ==
+                         candidate.ops.size());
+                    if (config.allow_noncontig_groups) {
+                        // File under seed's topo-index; the DP rebuilds the
+                        // canonical v0_topo_idx from ops, not from this key.
+                        by_start[topo_idx].push_back(candidate);
+                    } else if (is_contiguous) {
+                        by_start[candidate.start].push_back(candidate);
+                    }
                     ++accepted_candidates;
                 } else {
                     candidate.legality.is_valid = false;
@@ -3130,10 +3185,19 @@ std::vector<BitmaskGroup> BuildBitmaskGroups(
             if (!cand.metrics.valid) {
                 continue;
             }
-            // Compute bitmask over topo positions
+            // Compute bitmask over topo positions and derive the canonical
+            // v0_topo_idx (smallest topo position in the group) from ops,
+            // NOT from `start`. Seed-growth may file a non-contiguous
+            // candidate under the seed's topo-index, which is not
+            // necessarily the smallest topo position in the group.
             uint64_t mask = 0;
+            int v0_topo_idx = std::numeric_limits<int>::max();
             for (size_t op_id : cand.ops) {
-                mask |= (1ULL << graph.topo_pos[op_id]);
+                const int pos = static_cast<int>(graph.topo_pos[op_id]);
+                mask |= (1ULL << pos);
+                if (pos < v0_topo_idx) {
+                    v0_topo_idx = pos;
+                }
             }
             if (!seen_masks.insert(mask).second) {
                 continue;
@@ -3169,7 +3233,7 @@ std::vector<BitmaskGroup> BuildBitmaskGroups(
 
             BitmaskGroup bg;
             bg.mask = mask;
-            bg.v0_topo_idx = static_cast<int>(start);
+            bg.v0_topo_idx = v0_topo_idx;
             bg.candidate = cand;
             result.push_back(std::move(bg));
         }
@@ -3295,6 +3359,232 @@ std::vector<CandidateGroup> RecoverBitmaskSchedule(
         const BitmaskGroup& bg = groups[it->second.group_idx];
         schedule.push_back(bg.candidate);
         covered |= bg.mask;
+    }
+    return schedule;
+}
+
+// ---- Frontier DP for N > 20 (set-cover DP with arbitrary-width bitset) ----
+
+// Wide bitmask stored as a small vector of 64-bit words, indexed by topo
+// position (bit i = op at topo_order[i]).  Mirrors BitmaskGroup but without
+// the 64-bit ceiling.
+struct FrontierGroup {
+    std::vector<uint64_t> mask;
+    int v0_topo_idx = -1;  // smallest topo position in the group
+    CandidateGroup candidate;
+};
+
+struct FrontierMaskHash {
+    size_t operator()(const std::vector<uint64_t>& m) const noexcept {
+        // FNV-1a mix on the 64-bit words; good enough for memo keys.
+        size_t h = 1469598103934665603ULL;
+        for (uint64_t w : m) {
+            h ^= static_cast<size_t>(w);
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+};
+
+struct FrontierDecision {
+    bool   valid     = false;
+    double cost      = kInfinity;
+    size_t group_idx = 0;
+};
+
+// Returns the number of 64-bit words required to store `n` topo positions.
+static inline size_t FrontierNumWords(size_t n) { return (n + 63) / 64; }
+
+static inline bool FrontierTestBit(const std::vector<uint64_t>& m, size_t i) {
+    return (m[i >> 6] >> (i & 63)) & 1u;
+}
+
+static inline void FrontierSetBit(std::vector<uint64_t>& m, size_t i) {
+    m[i >> 6] |= (1ULL << (i & 63));
+}
+
+static inline bool FrontierAnyOverlap(const std::vector<uint64_t>& a,
+                                      const std::vector<uint64_t>& b) {
+    const size_t w = std::min(a.size(), b.size());
+    for (size_t i = 0; i < w; ++i) {
+        if (a[i] & b[i]) return true;
+    }
+    return false;
+}
+
+static inline void FrontierOrInto(std::vector<uint64_t>& dst,
+                                  const std::vector<uint64_t>& src) {
+    for (size_t i = 0; i < dst.size() && i < src.size(); ++i) {
+        dst[i] |= src[i];
+    }
+}
+
+// Convert position-indexed candidates to FrontierGroups, analogous to
+// BuildBitmaskGroups but without the 64-op ceiling.
+static std::vector<FrontierGroup> BuildFrontierGroups(
+    const OpGraph& graph,
+    const std::vector<std::vector<CandidateGroup>>& candidates) {
+    const size_t n = graph.topo_order.size();
+    const size_t W = FrontierNumWords(n);
+    std::vector<FrontierGroup> result;
+    std::unordered_set<std::vector<uint64_t>, FrontierMaskHash> seen_masks;
+    size_t partition_cycle_rejects = 0;
+
+    for (size_t start = 0; start < n; ++start) {
+        for (const auto& cand : candidates[start]) {
+            if (!cand.metrics.valid) continue;
+
+            std::vector<uint64_t> mask(W, 0ULL);
+            int v0_topo_idx = std::numeric_limits<int>::max();
+            for (size_t op_id : cand.ops) {
+                const int pos = static_cast<int>(graph.topo_pos[op_id]);
+                FrontierSetBit(mask, static_cast<size_t>(pos));
+                if (pos < v0_topo_idx) v0_topo_idx = pos;
+            }
+            if (!seen_masks.insert(mask).second) continue;
+
+            // Reject partition-DAG cycles (mirrors BuildBitmaskGroups).
+            std::unordered_set<size_t> group_set(cand.ops.begin(), cand.ops.end());
+            bool is_valid_partition = true;
+            for (size_t op_id : cand.ops) {
+                std::unordered_set<size_t> rest = group_set;
+                rest.erase(op_id);
+                if (rest.empty()) break;
+                if (!IsFusionValid(graph, rest, op_id)) {
+                    is_valid_partition = false;
+                    break;
+                }
+            }
+            if (!is_valid_partition) {
+                ++partition_cycle_rejects;
+                continue;
+            }
+
+            FrontierGroup fg;
+            fg.mask = std::move(mask);
+            fg.v0_topo_idx = v0_topo_idx;
+            fg.candidate = cand;
+            result.push_back(std::move(fg));
+        }
+    }
+    if (LegalityDebugEnabled() && partition_cycle_rejects > 0) {
+        std::cerr << "frontier rejects PARTITION_CYCLE="
+                  << partition_cycle_rejects << "\n";
+    }
+    return result;
+}
+
+// Set-cover DP for N > 20.  State = `covered` bitset over topo positions.
+// At each state we pick the first uncovered op whose predecessors are all
+// covered (deterministic frontier choice) and enumerate groups whose
+// smallest-topo-position op equals that pick.  This mirrors SolveBitmaskDPImpl
+// but uses a vector<uint64_t> state so N is not capped at 64.
+//
+// Safety: on memoization-cap overflow, returns kInfinity so the caller can
+// fall back to the positional DP.
+static double SolveFrontierDPImpl(
+    const Problem& problem,
+    const OpGraph& graph,
+    const std::vector<FrontierGroup>& groups,
+    const std::vector<std::vector<size_t>>& groups_by_v0,
+    size_t n,
+    const std::vector<uint64_t>& covered,
+    const std::vector<uint64_t>& full_mask,
+    size_t memo_cap,
+    std::unordered_map<std::vector<uint64_t>, FrontierDecision,
+                       FrontierMaskHash>* memo) {
+    if (covered == full_mask) {
+        return 0.0;
+    }
+    auto it = memo->find(covered);
+    if (it != memo->end()) {
+        return it->second.valid ? it->second.cost : kInfinity;
+    }
+    if (memo->size() >= memo_cap) {
+        // Overflow: tell caller the DP didn't complete.  The caller falls
+        // back to the positional DP.
+        return kInfinity;
+    }
+
+    // Pick first uncovered topo-position whose predecessors are all covered.
+    int v0_topo_idx = -1;
+    for (size_t i = 0; i < n; ++i) {
+        if (FrontierTestBit(covered, i)) continue;
+        size_t op_id = graph.topo_order[i];
+        bool ready = true;
+        for (size_t pred : graph.preds[op_id]) {
+            if (!FrontierTestBit(covered, graph.topo_pos[pred])) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready) {
+            v0_topo_idx = static_cast<int>(i);
+            break;
+        }
+    }
+    if (v0_topo_idx < 0) {
+        (*memo)[covered] = {};
+        return kInfinity;
+    }
+
+    FrontierDecision best;
+    if (static_cast<size_t>(v0_topo_idx) < groups_by_v0.size()) {
+        for (size_t group_idx : groups_by_v0[v0_topo_idx]) {
+            const FrontierGroup& fg = groups[group_idx];
+            if (FrontierAnyOverlap(fg.mask, covered)) continue;
+
+            // Every op in the group must be ready: its preds are either in
+            // `covered` or internal to the group itself.
+            bool group_ready = true;
+            for (size_t i = 0; i < n && group_ready; ++i) {
+                if (!FrontierTestBit(fg.mask, i)) continue;
+                size_t op_id = graph.topo_order[i];
+                for (size_t pred : graph.preds[op_id]) {
+                    const size_t pt = graph.topo_pos[pred];
+                    if (!FrontierTestBit(covered, pt) &&
+                        !FrontierTestBit(fg.mask, pt)) {
+                        group_ready = false;
+                        break;
+                    }
+                }
+            }
+            if (!group_ready) continue;
+
+            std::vector<uint64_t> new_covered = covered;
+            FrontierOrInto(new_covered, fg.mask);
+            const double group_cost = fg.candidate.metrics.latency;
+            const double future = SolveFrontierDPImpl(
+                problem, graph, groups, groups_by_v0, n,
+                new_covered, full_mask, memo_cap, memo);
+            if (!std::isfinite(future)) continue;
+            const double total = group_cost + future;
+            if (total < best.cost) {
+                best.valid     = true;
+                best.cost      = total;
+                best.group_idx = group_idx;
+            }
+        }
+    }
+
+    (*memo)[covered] = best;
+    return best.valid ? best.cost : kInfinity;
+}
+
+// Recover ordered schedule from the frontier DP memo.
+static std::vector<CandidateGroup> RecoverFrontierSchedule(
+    const std::vector<FrontierGroup>& groups,
+    const std::vector<uint64_t>& full_mask,
+    const std::unordered_map<std::vector<uint64_t>, FrontierDecision,
+                             FrontierMaskHash>& memo) {
+    std::vector<CandidateGroup> schedule;
+    std::vector<uint64_t> covered(full_mask.size(), 0ULL);
+    while (covered != full_mask) {
+        auto it = memo.find(covered);
+        if (it == memo.end() || !it->second.valid) break;
+        const FrontierGroup& fg = groups[it->second.group_idx];
+        schedule.push_back(fg.candidate);
+        FrontierOrInto(covered, fg.mask);
     }
     return schedule;
 }
@@ -3563,15 +3853,144 @@ Solution SolveWithPaperOptimus(const Problem& problem) {
     config.candidate_mode = GetCandidateGenerationMode();
     config.guidance_mode = GuidanceMode::kContest;
 
-    // Generate candidates using the standard interval approach.
+    // Generate candidates. Dispatch on candidate_mode so seed-growth (which
+    // produces DAG-aware, possibly non-topologically-contiguous groups)
+    // reaches the bitmask/frontier set-cover DP instead of being silently
+    // replaced by interval-only candidates.
     // AddAnalyticalTileCandidates is already injected into BuildBestCandidate,
     // so all candidates benefit from Paper Eq. 4 tile sizing.
-    std::vector<std::vector<CandidateGroup>> candidates =
-        GenerateCandidates(problem, graph, config);
+    std::vector<std::vector<CandidateGroup>> candidates;
+    if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth) {
+        // Allow non-contiguous candidates because the bitmask/frontier DP
+        // handles them correctly via a set-cover formulation.
+        config.allow_noncontig_groups = true;
+        std::cerr << "Optimus paper: seed-growth candidates (non-contig allowed)\n";
+        candidates = GenerateSeedGrowthCandidates(problem, graph, config);
+    } else {
+        candidates = GenerateCandidates(problem, graph, config);
+    }
 
     if (n > 20) {
-        // Too many ops for bitmask DP (2^N states). Use positional DP fallback.
-        // Analytical tile candidates still help here.
+        // For N > 20, prefer the frontier set-cover DP when seed-growth is
+        // active (needed to evaluate non-contiguous candidates).  Fall back
+        // to the positional DP on memo-cap overflow or empty schedule.
+        if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth) {
+            std::cerr << "Optimus paper: frontier DP (N=" << n << ")\n";
+            std::vector<FrontierGroup> fgroups =
+                BuildFrontierGroups(graph, candidates);
+            std::cerr << "Optimus paper: " << fgroups.size()
+                      << " frontier groups\n";
+
+            // Ensure every topo position has at least one singleton group
+            // whose mask is exactly that single position. Seed-growth only
+            // guarantees v0_topo_idx coverage, which is necessary but not
+            // sufficient: a multi-op group has v0 equal to its smallest
+            // position but cannot be picked when earlier positions in that
+            // group's topo-prefix-range are uncovered.
+            {
+                std::unordered_set<size_t> singleton_positions;
+                for (const auto& fg : fgroups) {
+                    // Count bits set; if exactly 1 and it equals v0, this is
+                    // a singleton for that position.
+                    size_t bit_count = 0;
+                    for (uint64_t w : fg.mask) bit_count += __builtin_popcountll(w);
+                    if (bit_count == 1 &&
+                        FrontierTestBit(fg.mask,
+                                        static_cast<size_t>(fg.v0_topo_idx))) {
+                        singleton_positions.insert(
+                            static_cast<size_t>(fg.v0_topo_idx));
+                    }
+                }
+                size_t added = 0, invalid = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    if (singleton_positions.count(i)) continue;
+                    CandidateGroup fallback = BuildBestCandidate(
+                        problem, graph, i, i, config);
+                    if (!fallback.metrics.valid) { ++invalid; continue; }
+                    FrontierGroup fg;
+                    fg.mask.assign(FrontierNumWords(n), 0ULL);
+                    FrontierSetBit(fg.mask, i);
+                    fg.v0_topo_idx = static_cast<int>(i);
+                    fg.candidate = std::move(fallback);
+                    fgroups.push_back(std::move(fg));
+                    ++added;
+                }
+                std::cerr << "Optimus paper: added " << added
+                          << " fallback singletons (" << invalid
+                          << " invalid, "
+                          << singleton_positions.size()
+                          << " already covered)\n";
+            }
+
+            std::vector<std::vector<size_t>> groups_by_v0(n);
+            for (size_t i = 0; i < fgroups.size(); ++i) {
+                int v0 = fgroups[i].v0_topo_idx;
+                if (v0 >= 0 && static_cast<size_t>(v0) < n) {
+                    groups_by_v0[v0].push_back(i);
+                }
+            }
+            // Diagnostic: flag topo positions with no groups.  Every position
+            // must have at least the singleton (added above) unless its
+            // BuildBestCandidate returned invalid.  Missing coverage => the
+            // frontier DP cannot make forward progress past that position.
+            if (LegalityDebugEnabled()) {
+                size_t missing = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    if (groups_by_v0[i].empty()) {
+                        if (missing < 20) {
+                            std::cerr << "Optimus paper: no groups for topo pos "
+                                      << i << " (op "
+                                      << graph.topo_order[i] << ")\n";
+                        }
+                        ++missing;
+                    }
+                }
+                if (missing > 0) {
+                    std::cerr << "Optimus paper: " << missing
+                              << " topo positions have no groups\n";
+                }
+            }
+
+            std::vector<uint64_t> full_mask(FrontierNumWords(n), 0ULL);
+            for (size_t i = 0; i < n; ++i) FrontierSetBit(full_mask, i);
+            std::vector<uint64_t> covered(FrontierNumWords(n), 0ULL);
+
+            // Default cap sized so bm-17 (N=103, ~5M reachable states in
+            // practice) completes without truncation. Overridable via env.
+            size_t memo_cap = 10000000;
+            if (const char* cap_env = std::getenv("MLSYS_OPTIMUS_FRONTIER_MEMO_CAP")) {
+                const long parsed = std::atol(cap_env);
+                if (parsed > 0) memo_cap = static_cast<size_t>(parsed);
+            }
+
+            std::unordered_map<std::vector<uint64_t>, FrontierDecision,
+                               FrontierMaskHash> fmemo;
+            const double fcost = SolveFrontierDPImpl(
+                problem, graph, fgroups, groups_by_v0, n,
+                covered, full_mask, memo_cap, &fmemo);
+            // Count how many memoized states are dead-ends vs leads.
+            size_t dead_states = 0, live_states = 0;
+            for (const auto& kv : fmemo) {
+                if (kv.second.valid) ++live_states; else ++dead_states;
+            }
+            std::cerr << "Optimus paper frontier DP cost: " << fcost
+                      << " memo_size=" << fmemo.size()
+                      << " live=" << live_states
+                      << " dead=" << dead_states
+                      << " cap=" << memo_cap << "\n";
+
+            if (std::isfinite(fcost)) {
+                auto schedule = RecoverFrontierSchedule(fgroups, full_mask, fmemo);
+                if (!schedule.empty()) {
+                    Solution sol = BuildSolutionFromSchedule(problem, schedule);
+                    if (!sol.subgraphs.empty()) return sol;
+                }
+            }
+            std::cerr << "Optimus paper: frontier DP unusable, "
+                         "falling back to positional DP\n";
+        }
+
+        // Positional DP fallback (interval candidates, or frontier overflow).
         std::cerr << "Optimus paper: positional DP fallback (N=" << n << ")\n";
         const size_t num_ops = graph.topo_order.size();
         std::vector<std::unordered_set<size_t>> useful_inputs_by_start(num_ops);
