@@ -271,7 +271,7 @@ struct SeedGrowthRuntimeConfig {
     size_t max_states_per_seed = 0;
     bool allow_predecessor_growth = true;
     bool allow_successor_growth = true;
-    bool require_contiguous_topo = false;
+    bool require_contiguous_topo = true;
 };
 
 struct LegalityPolicyConfig {
@@ -420,7 +420,7 @@ SeedGrowthRuntimeConfig GetSeedGrowthRuntimeConfig() {
     config.allow_successor_growth = ReadBoolEnvOrDefault(
         "MLSYS_OPTIMUS_SEED_ALLOW_SUCC", true);
     config.require_contiguous_topo = ReadBoolEnvOrDefault(
-        "MLSYS_OPTIMUS_SEED_REQUIRE_CONTIGUOUS", false);
+        "MLSYS_OPTIMUS_SEED_REQUIRE_CONTIGUOUS", true);
     if (!config.allow_predecessor_growth && !config.allow_successor_growth) {
         config.allow_successor_growth = true;
     }

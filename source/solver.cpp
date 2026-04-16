@@ -353,7 +353,7 @@ Solution Solve(const Problem& problem) {
             break;
     }
 
-    std::cerr << "Solution: " << best.subgraphs.size() << " subgraphs\n";
+    // Summary printed in main.cpp with ops coverage info.
     return best;
 }
 

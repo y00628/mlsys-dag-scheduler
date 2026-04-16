@@ -24,6 +24,10 @@ class RunResult:
     empty_seed_starts: int
     avg_candidates_per_start: float
     timed_out: bool
+    valid: bool = True
+    ops_covered: int = 0
+    ops_total: int = 0
+    validation_errors: int = 0
 
 
 def topo_order(problem: dict) -> List[int]:
@@ -161,12 +165,10 @@ def run_one(binary: str, benchmark_path: str, mode: str, out_dir: str, timeout_s
             f"stderr(partial tail):\n{stderr_text[-4000:]}\n"
         )
 
-    if p.returncode != 0:
-        raise RuntimeError(
-            f"Run failed for {bench_name} [{mode}] returncode={p.returncode}\n"
-            f"stderr tail:\n{stderr_text[-4000:]}\n"
-        )
     t1 = time.perf_counter()
+    # Don't raise on non-zero return code — main.cpp now returns 1 for
+    # invalid solutions (after writing the output file).  The ERROR: lines
+    # in stderr are parsed below and recorded in the RunResult instead.
 
     with open(out_path, "r", encoding="utf-8") as f:
         sol = json.load(f)
@@ -183,6 +185,23 @@ def run_one(binary: str, benchmark_path: str, mode: str, out_dir: str, timeout_s
 
     seed_starts, empty_seed_starts, avg_candidates = parse_seed_stats(stderr_text)
 
+    # Validation: the C++ evaluator (RecomputeLatencies in main.cpp) prints
+    # "ERROR:" lines to stderr for invalid solutions.  Parse them directly
+    # instead of re-implementing the checks in Python.
+    error_lines = [ln for ln in stderr_text.splitlines() if ln.startswith("ERROR:")]
+    is_valid = len(error_lines) == 0
+
+    # Count ops covered from the solution JSON for diagnostics.
+    all_op_ids = {op for sg in subgraphs for op in sg}
+    num_ops = len(problem.get("op_types", []))
+
+    if not is_valid:
+        print(f"  [INVALID] {bench_name} {mode}: {len(error_lines)} errors", flush=True)
+        for err in error_lines[:5]:
+            print(f"    {err}", flush=True)
+        if len(error_lines) > 5:
+            print(f"    ... and {len(error_lines) - 5} more", flush=True)
+
     return RunResult(
         benchmark=bench_name,
         mode=mode,
@@ -194,6 +213,10 @@ def run_one(binary: str, benchmark_path: str, mode: str, out_dir: str, timeout_s
         empty_seed_starts=empty_seed_starts,
         avg_candidates_per_start=avg_candidates,
         timed_out=timed_out,
+        valid=is_valid,
+        ops_covered=len(all_op_ids),
+        ops_total=num_ops,
+        validation_errors=len(error_lines),
     )
 
 
@@ -255,34 +278,74 @@ def main():
                     continue
                 raise
 
-    print("\n# Mode comparison summary\n")
-    print(
-        "benchmark\tmode\twall_sec\ttotal_latency\tsubgraphs\tnon_contig_ratio\t"
-        "seed_starts\tempty_starts\tavg_candidates"
-    )
-    for r in results:
-        print(
-            f"{r.benchmark}\t{r.mode}\t{r.wall_time_sec:.4f}\t{r.total_latency:.1f}\t"
-            f"{r.n_subgraphs}\t{r.selected_non_contiguous_ratio:.3f}\t"
-            f"{r.seed_starts}\t{r.empty_seed_starts}\t{r.avg_candidates_per_start:.2f}"
-        )
+    # ---- Pretty-printed results table ----
+    def fmt_latency(lat: float) -> str:
+        if lat >= 1e6:
+            return f"{lat/1e6:.2f}M"
+        if lat >= 1e3:
+            return f"{lat/1e3:.1f}K"
+        return f"{lat:.1f}"
 
-    # Aggregate by mode
+    print("\n# Mode comparison summary\n")
+    headers = ["benchmark", "mode", "valid", "ops", "subgraphs", "latency", "wall_sec"]
+    rows = []
+    for r in results:
+        status = "OK" if r.valid else f"FAIL({r.validation_errors})"
+        rows.append([
+            r.benchmark,
+            r.mode,
+            status,
+            f"{r.ops_covered}/{r.ops_total}",
+            str(r.n_subgraphs),
+            fmt_latency(r.total_latency),
+            f"{r.wall_time_sec:.2f}s",
+        ])
+
+    # Compute column widths for alignment.
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
+
+    def fmt_row(cells: List[str]) -> str:
+        return "  ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(cells))
+
+    print(fmt_row(headers))
+    print("  ".join("-" * w for w in col_widths))
+    for row in rows:
+        print(fmt_row(row))
+
+    # ---- Aggregate by mode ----
     print("\n# Aggregate by mode\n")
+    agg_headers = ["mode", "valid", "avg_latency", "avg_wall", "runs"]
+    agg_rows = []
     for mode in modes:
         subset = [r for r in results if r.mode == mode]
         if not subset:
-            print(f"{mode}: no successful runs")
             continue
+        n_valid = sum(1 for r in subset if r.valid)
         avg_wall = sum(r.wall_time_sec for r in subset) / max(1, len(subset))
         avg_lat = sum(r.total_latency for r in subset) / max(1, len(subset))
-        avg_non_contig = sum(r.selected_non_contiguous_ratio for r in subset) / max(1, len(subset))
-        avg_empty = sum(r.empty_seed_starts for r in subset) / max(1, len(subset))
-        print(
-            f"{mode}: avg_wall={avg_wall:.4f}s, avg_latency={avg_lat:.1f}, "
-            f"avg_non_contig_ratio={avg_non_contig:.3f}, avg_empty_seed_starts={avg_empty:.2f}, "
-            f"successful_runs={len(subset)}/{len(benches)}"
-        )
+        valid_str = f"{n_valid}/{len(subset)}"
+        if n_valid < len(subset):
+            valid_str += " !!!"
+        agg_rows.append([
+            mode,
+            valid_str,
+            fmt_latency(avg_lat),
+            f"{avg_wall:.2f}s",
+            f"{len(subset)}/{len(benches)}",
+        ])
+
+    agg_widths = [len(h) for h in agg_headers]
+    for row in agg_rows:
+        for i, cell in enumerate(row):
+            agg_widths[i] = max(agg_widths[i], len(cell))
+
+    print("  ".join(h.ljust(agg_widths[i]) for i, h in enumerate(agg_headers)))
+    print("  ".join("-" * w for w in agg_widths))
+    for row in agg_rows:
+        print("  ".join(cell.ljust(agg_widths[i]) for i, cell in enumerate(row)))
 
     # Pass/fail hints for Phase-1 checklist.
     by_mode = {m: [r for r in results if r.mode == m] for m in modes}
