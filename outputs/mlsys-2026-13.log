@@ -3,10 +3,10 @@ Problem: 100 tensors, 63 ops, fast_mem=600000, slow_bw=50
 Solver backend: optimus_paper
 Optimus paper: N=63
 Optimus paper: seed-growth candidates (non-contig allowed)
-Optimus paper: frontier DP (N=63)
-Optimus paper: 212 frontier groups
-Optimus paper: added 29 fallback singletons (0 invalid, 34 already covered)
-Optimus paper frontier DP cost: 1.66402e+08 memo_size=131192 live=131192 dead=0 cap=10000000
-Solution: 27 subgraphs, 63/63 ops covered
+Optimus paper: found 1 chunk cuts
+Optimus paper: segment 0 size=35 topo=[0..34]
+Optimus paper: segment 1 size=28 topo=[35..62]
+Optimus paper: decomposition succeeded (31 subgraphs)
+Solution: 31 subgraphs, 63/63 ops covered
 Solution written to: outputs/mlsys-2026-13_solution.json
 Total latency: 1.66402e+08

@@ -22,9 +22,11 @@ make submission   # release + zip package for submission
 
 | Variable | Values | Default | Purpose |
 |---|---|---|---|
-| `MLSYS_SOLVER` | `baseline`, `optimus`, `optimus_conv`, `optimus_conv_v2` | `optimus` | Solver backend |
+| `MLSYS_SOLVER` | `baseline`, `optimus`, `optimus_conv`, `optimus_conv_v2`, `optimus_paper` | `optimus` | Solver backend |
 | `MLSYS_OPTIMUS_CANDIDATES` | `interval`, `seed` | `interval` | Candidate generation mode |
 | `MLSYS_OPTIMUS_CONV_DATAFLOW` | `os`, `ws`, `is`, `rs` | `rs` | Conv dataflow (conv backends only) |
+| `MLSYS_OPTIMUS_MAX_SEG_SIZE` | integer | `25` | Max segment size for graph-cut decomposition (`optimus_paper` only) |
+| `MLSYS_OPTIMUS_FRONTIER_MEMO_CAP` | integer | `10000000` | Frontier DP memo cap (states) |
 
 Example:
 ```bash
@@ -91,7 +93,24 @@ Solve()
 - The **optimus solver** calls `EvaluateSubgraph()` directly during search, so the solver's cost model is aligned with the final scorer.
 - **Conv guidance** uses pseudo-conv mapping (tensor height → spatial, width → channels) since the problem schema only has MatMul/Pointwise, not real conv ops.
 
-## Known Benchmark Results (optimus, interval)
+## Known Benchmark Results
+
+### Best config: `optimus_paper` + `seed` (with graph-cut decomposition)
+
+| Benchmark | N ops | Latency | Wall time |
+|---|---:|---:|---:|
+| mlsys-2026-1 | 5 | 405,875 | <1s |
+| mlsys-2026-5 | 19 | 759,125 | <1s |
+| mlsys-2026-9 | 32 | 164,506,000 | ~43s |
+| mlsys-2026-13 | 63 | 166,404,000 | ~9s |
+| mlsys-2026-17 | 103 | 46,338,000 | ~2s |
+
+Run with:
+```bash
+MLSYS_SOLVER=optimus_paper MLSYS_OPTIMUS_CANDIDATES=seed ./build/mlsys benchmarks/mlsys-2026-N.json outputs/out-N.json
+```
+
+### Baseline: `optimus` + `interval`
 
 | Benchmark | Latency |
 |---|---:|
