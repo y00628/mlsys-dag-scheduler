@@ -133,6 +133,9 @@ struct SchedulerEstimate {
     double estimated_memory_traffic_bytes = 0.0;
     double scheduler_latency_estimate = std::numeric_limits<double>::infinity();
     double confidence = 0.0;  // [0,1], lower for non-linear fallback
+    // ISOA: populated for valid linear chains only.
+    ISOADecision isoa;
+    int64_t isoa_reduced_working_set_bytes = 0;
 };
 
 struct CandidateGroup {
@@ -985,6 +988,12 @@ SchedulerEstimate RunSchedulerAnalysis(const Problem& problem, const OpGraph& gr
             estimate.estimated_memory_traffic_bytes =
                 reuse_est.effective_traffic_bytes;
             estimate.scheduler_latency_estimate = reuse_est.latency;
+            // Capture ISOA decision for downstream working-set correction.
+            estimate.isoa = conv_est.isoa;
+            estimate.isoa_reduced_working_set_bytes =
+                conv_est.isoa.minimum_activation_bytes +
+                conv_est.working_set.parameter_bytes +
+                conv_est.working_set.line_buffer_bytes;
 
             // Confidence: higher when reuse is possible.
             double confidence = reuse_est.reuse_possible ? 0.9 : 0.5;
@@ -1733,6 +1742,49 @@ size_t ComputeRefineBudget(
     return std::min(budget, proxy_ranked.size());
 }
 
+// Returns the minimum working set bytes for a candidate group + granularity,
+// taking ISOA into account for linear MatMul chains.
+//
+// ISOA only overrides the base estimate when the base estimate EXCEEDS the
+// fast_memory_capacity threshold — i.e., ISOA is used as a rescue path to
+// admit granularities that would otherwise be rejected, not as a general
+// replacement for the proxy working-set estimate.  This avoids mis-ranking
+// granularities that fit without ISOA by injecting a lower (but evaluator-
+// misaligned) estimate for already-passing tiles.
+//
+// Returns the ISOA-reduced bytes only when base_ws > capacity AND isoa_ws fits.
+// Otherwise returns base_ws unchanged.
+int64_t ISOAAwareWorkingSetBytes(const Problem& problem, const OpGraph& graph,
+                                  const std::vector<size_t>& ops,
+                                  const GroupBoundary& boundary,
+                                  const Granularity& granularity,
+                                  bool is_linear_chain) {
+    const int64_t base_ws =
+        EstimateWorkingSetBytes(problem, graph, ops, boundary, granularity);
+    // Fast path: already fits, or not a linear MatMul chain.
+    if (base_ws <= problem.fast_memory_capacity ||
+        !is_linear_chain || !ContainsMatMul(problem, ops)) {
+        return base_ws;
+    }
+    // Base estimate exceeds capacity — try ISOA rescue.
+    std::vector<Conv2DOp> conv_ops;
+    conv_ops.reserve(ops.size());
+    for (size_t op_id : ops) conv_ops.push_back(BuildPseudoConvOp(problem, op_id));
+    const ConvAcceleratorSpec spec = BuildConvAcceleratorSpec(problem);
+    const ConvTileShape terminal_tile =
+        BuildPseudoConvTerminalTile(problem, ops, granularity);
+    const ConvGroupScheduleEstimate conv_est =
+        AnalyzeConvChain(conv_ops, spec, terminal_tile);
+    if (!conv_est.valid || conv_est.isoa.minimum_activation_bytes <= 0) {
+        return base_ws;
+    }
+    const int64_t isoa_ws = conv_est.isoa.minimum_activation_bytes +
+                             conv_est.working_set.parameter_bytes +
+                             conv_est.working_set.line_buffer_bytes;
+    // Only use ISOA estimate if it's strictly better (rescues the candidate).
+    return (isoa_ws < base_ws) ? isoa_ws : base_ws;
+}
+
 CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
                                   const std::vector<size_t>& input_ops,
                                   const OptimusConfig& config) {
@@ -1777,13 +1829,15 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         BuildSpatialCandidates(ref_out.height, problem.native_granularity.height);
     const auto k_candidates = BuildKCandidates(problem, candidate.ops);
     std::vector<std::pair<double, Granularity>> proxy_ranked;
+    const bool is_linear = IsLinearChainCandidate(graph, candidate.ops);
 
     for (int64_t width : width_candidates) {
         for (int64_t height : height_candidates) {
             for (int64_t depth : k_candidates) {
                 Granularity granularity{width, height, depth};
-                const int64_t working_set = EstimateWorkingSetBytes(
-                    problem, graph, candidate.ops, candidate.boundary, granularity);
+                const int64_t working_set = ISOAAwareWorkingSetBytes(
+                    problem, graph, candidate.ops, candidate.boundary,
+                    granularity, is_linear);
                 if (working_set > problem.fast_memory_capacity) {
                     continue;
                 }
@@ -1871,6 +1925,19 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         }
     }
 
+    // ISOA correction: if the evaluator-computed working set exceeds capacity,
+    // try the ISOA-reduced estimate to allow the candidate to survive retain
+    // choices in DP (IsCapacityFeasible uses candidate.metrics.working_set_bytes).
+    if (candidate.metrics.valid && is_linear &&
+        candidate.metrics.working_set_bytes > problem.fast_memory_capacity) {
+        const int64_t isoa_ws = ISOAAwareWorkingSetBytes(
+            problem, graph, candidate.ops, candidate.boundary,
+            candidate.granularity, true);
+        if (isoa_ws < candidate.metrics.working_set_bytes) {
+            candidate.metrics.working_set_bytes = isoa_ws;
+        }
+    }
+
     if (std::getenv("MLSYS_OPTIMUS_DEBUG_TILE")) {
         std::cerr << "[cand] ops=[";
         for (size_t i = 0; i < candidate.ops.size(); ++i) {
@@ -1944,13 +2011,15 @@ CandidateGroup BuildBestCandidateWithScheduler(
         BuildSpatialCandidates(ref_out.height, problem.native_granularity.height);
     const auto k_candidates = BuildKCandidates(problem, candidate.ops);
     std::vector<std::pair<double, Granularity>> proxy_ranked;
+    const bool is_linear = IsLinearChainCandidate(graph, candidate.ops);
 
     for (int64_t width : width_candidates) {
         for (int64_t height : height_candidates) {
             for (int64_t depth : k_candidates) {
                 Granularity granularity{width, height, depth};
-                const int64_t working_set = EstimateWorkingSetBytes(
-                    problem, graph, candidate.ops, candidate.boundary, granularity);
+                const int64_t working_set = ISOAAwareWorkingSetBytes(
+                    problem, graph, candidate.ops, candidate.boundary,
+                    granularity, is_linear);
                 if (working_set > problem.fast_memory_capacity) {
                     continue;
                 }
@@ -1990,9 +2059,10 @@ CandidateGroup BuildBestCandidateWithScheduler(
                 }
             }
             if (!exists) {
-                // Verify working set fits.
-                int64_t ws = EstimateWorkingSetBytes(
-                    problem, graph, candidate.ops, candidate.boundary, proposed);
+                // Verify working set fits (ISOA-aware for linear chains).
+                int64_t ws = ISOAAwareWorkingSetBytes(
+                    problem, graph, candidate.ops, candidate.boundary,
+                    proposed, is_linear);
                 if (ws <= problem.fast_memory_capacity) {
                     double proxy_score = EstimateProxyLatency(
                         problem, graph, candidate.ops, candidate.boundary, proposed);
@@ -2052,6 +2122,19 @@ CandidateGroup BuildBestCandidateWithScheduler(
         candidate.scheduler = RunSchedulerAnalysis(
             problem, graph, candidate.ops, candidate.boundary,
             candidate.granularity);
+    }
+
+    // ISOA correction: if the evaluator-computed working set exceeds capacity,
+    // try the ISOA-reduced estimate to allow the candidate to survive retain
+    // choices in DP (IsCapacityFeasible uses candidate.metrics.working_set_bytes).
+    if (candidate.metrics.valid && is_linear &&
+        candidate.metrics.working_set_bytes > problem.fast_memory_capacity) {
+        const int64_t isoa_ws = ISOAAwareWorkingSetBytes(
+            problem, graph, candidate.ops, candidate.boundary,
+            candidate.granularity, true);
+        if (isoa_ws < candidate.metrics.working_set_bytes) {
+            candidate.metrics.working_set_bytes = isoa_ws;
+        }
     }
 
     return candidate;
