@@ -2,13 +2,13 @@ Loaded problem from: benchmarks/mlsys-2026-17.json
 Problem: 160 tensors, 103 ops, fast_mem=500000, slow_bw=100
 Solver backend: optimus_paper
 Optimus paper: N=103
-Optimus paper: seed-growth candidates (non-contig allowed)
-Optimus paper: found 3 chunk cuts
-Optimus paper: segment 0 size=27 topo=[0..26]
-Optimus paper: segment 1 size=35 topo=[27..61]
-Optimus paper: segment 2 size=40 topo=[62..101]
-Optimus paper: segment 3 size=1 topo=[102..102]
-Optimus paper: decomposition succeeded (70 subgraphs)
-Solution: 70 subgraphs, 103/103 ops covered
+Optimus paper: found 4 chunk cuts
+Optimus paper: segment 0 size=19 topo=[0..18]
+Optimus paper: segment 1 size=19 topo=[19..37]
+Optimus paper: segment 2 size=25 topo=[38..62]
+Optimus paper: segment 3 size=31 topo=[63..93]
+Optimus paper: segment 4 size=9 topo=[94..102]
+Optimus paper: decomposition succeeded (75 subgraphs)
+Solution: 75 subgraphs, 103/103 ops covered
 Solution written to: outputs/mlsys-2026-17_solution.json
-Total latency: 4.63391e+07
+Total latency: 4.63388e+07
