@@ -133,6 +133,9 @@ struct SchedulerEstimate {
     double estimated_memory_traffic_bytes = 0.0;
     double scheduler_latency_estimate = std::numeric_limits<double>::infinity();
     double confidence = 0.0;  // [0,1], lower for non-linear fallback
+    // ISOA: populated for valid linear chains only.
+    ISOADecision isoa;
+    int64_t isoa_reduced_working_set_bytes = 0;
 };
 
 struct CandidateGroup {
@@ -985,6 +988,12 @@ SchedulerEstimate RunSchedulerAnalysis(const Problem& problem, const OpGraph& gr
             estimate.estimated_memory_traffic_bytes =
                 reuse_est.effective_traffic_bytes;
             estimate.scheduler_latency_estimate = reuse_est.latency;
+            // Capture ISOA decision for downstream working-set correction.
+            estimate.isoa = conv_est.isoa;
+            estimate.isoa_reduced_working_set_bytes =
+                conv_est.isoa.minimum_activation_bytes +
+                conv_est.working_set.parameter_bytes +
+                conv_est.working_set.line_buffer_bytes;
 
             // Confidence: higher when reuse is possible.
             double confidence = reuse_est.reuse_possible ? 0.9 : 0.5;
@@ -1733,6 +1742,49 @@ size_t ComputeRefineBudget(
     return std::min(budget, proxy_ranked.size());
 }
 
+// Returns the minimum working set bytes for a candidate group + granularity,
+// taking ISOA into account for linear MatMul chains.
+//
+// ISOA only overrides the base estimate when the base estimate EXCEEDS the
+// fast_memory_capacity threshold — i.e., ISOA is used as a rescue path to
+// admit granularities that would otherwise be rejected, not as a general
+// replacement for the proxy working-set estimate.  This avoids mis-ranking
+// granularities that fit without ISOA by injecting a lower (but evaluator-
+// misaligned) estimate for already-passing tiles.
+//
+// Returns the ISOA-reduced bytes only when base_ws > capacity AND isoa_ws fits.
+// Otherwise returns base_ws unchanged.
+int64_t ISOAAwareWorkingSetBytes(const Problem& problem, const OpGraph& graph,
+                                  const std::vector<size_t>& ops,
+                                  const GroupBoundary& boundary,
+                                  const Granularity& granularity,
+                                  bool is_linear_chain) {
+    const int64_t base_ws =
+        EstimateWorkingSetBytes(problem, graph, ops, boundary, granularity);
+    // Fast path: already fits, or not a linear MatMul chain.
+    if (base_ws <= problem.fast_memory_capacity ||
+        !is_linear_chain || !ContainsMatMul(problem, ops)) {
+        return base_ws;
+    }
+    // Base estimate exceeds capacity — try ISOA rescue.
+    std::vector<Conv2DOp> conv_ops;
+    conv_ops.reserve(ops.size());
+    for (size_t op_id : ops) conv_ops.push_back(BuildPseudoConvOp(problem, op_id));
+    const ConvAcceleratorSpec spec = BuildConvAcceleratorSpec(problem);
+    const ConvTileShape terminal_tile =
+        BuildPseudoConvTerminalTile(problem, ops, granularity);
+    const ConvGroupScheduleEstimate conv_est =
+        AnalyzeConvChain(conv_ops, spec, terminal_tile);
+    if (!conv_est.valid || conv_est.isoa.minimum_activation_bytes <= 0) {
+        return base_ws;
+    }
+    const int64_t isoa_ws = conv_est.isoa.minimum_activation_bytes +
+                             conv_est.working_set.parameter_bytes +
+                             conv_est.working_set.line_buffer_bytes;
+    // Only use ISOA estimate if it's strictly better (rescues the candidate).
+    return (isoa_ws < base_ws) ? isoa_ws : base_ws;
+}
+
 CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
                                   const std::vector<size_t>& input_ops,
                                   const OptimusConfig& config) {
@@ -1777,13 +1829,15 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         BuildSpatialCandidates(ref_out.height, problem.native_granularity.height);
     const auto k_candidates = BuildKCandidates(problem, candidate.ops);
     std::vector<std::pair<double, Granularity>> proxy_ranked;
+    const bool is_linear = IsLinearChainCandidate(graph, candidate.ops);
 
     for (int64_t width : width_candidates) {
         for (int64_t height : height_candidates) {
             for (int64_t depth : k_candidates) {
                 Granularity granularity{width, height, depth};
-                const int64_t working_set = EstimateWorkingSetBytes(
-                    problem, graph, candidate.ops, candidate.boundary, granularity);
+                const int64_t working_set = ISOAAwareWorkingSetBytes(
+                    problem, graph, candidate.ops, candidate.boundary,
+                    granularity, is_linear);
                 if (working_set > problem.fast_memory_capacity) {
                     continue;
                 }
@@ -1871,6 +1925,19 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         }
     }
 
+    // ISOA correction: if the evaluator-computed working set exceeds capacity,
+    // try the ISOA-reduced estimate to allow the candidate to survive retain
+    // choices in DP (IsCapacityFeasible uses candidate.metrics.working_set_bytes).
+    if (candidate.metrics.valid && is_linear &&
+        candidate.metrics.working_set_bytes > problem.fast_memory_capacity) {
+        const int64_t isoa_ws = ISOAAwareWorkingSetBytes(
+            problem, graph, candidate.ops, candidate.boundary,
+            candidate.granularity, true);
+        if (isoa_ws < candidate.metrics.working_set_bytes) {
+            candidate.metrics.working_set_bytes = isoa_ws;
+        }
+    }
+
     if (std::getenv("MLSYS_OPTIMUS_DEBUG_TILE")) {
         std::cerr << "[cand] ops=[";
         for (size_t i = 0; i < candidate.ops.size(); ++i) {
@@ -1944,13 +2011,15 @@ CandidateGroup BuildBestCandidateWithScheduler(
         BuildSpatialCandidates(ref_out.height, problem.native_granularity.height);
     const auto k_candidates = BuildKCandidates(problem, candidate.ops);
     std::vector<std::pair<double, Granularity>> proxy_ranked;
+    const bool is_linear = IsLinearChainCandidate(graph, candidate.ops);
 
     for (int64_t width : width_candidates) {
         for (int64_t height : height_candidates) {
             for (int64_t depth : k_candidates) {
                 Granularity granularity{width, height, depth};
-                const int64_t working_set = EstimateWorkingSetBytes(
-                    problem, graph, candidate.ops, candidate.boundary, granularity);
+                const int64_t working_set = ISOAAwareWorkingSetBytes(
+                    problem, graph, candidate.ops, candidate.boundary,
+                    granularity, is_linear);
                 if (working_set > problem.fast_memory_capacity) {
                     continue;
                 }
@@ -1990,9 +2059,10 @@ CandidateGroup BuildBestCandidateWithScheduler(
                 }
             }
             if (!exists) {
-                // Verify working set fits.
-                int64_t ws = EstimateWorkingSetBytes(
-                    problem, graph, candidate.ops, candidate.boundary, proposed);
+                // Verify working set fits (ISOA-aware for linear chains).
+                int64_t ws = ISOAAwareWorkingSetBytes(
+                    problem, graph, candidate.ops, candidate.boundary,
+                    proposed, is_linear);
                 if (ws <= problem.fast_memory_capacity) {
                     double proxy_score = EstimateProxyLatency(
                         problem, graph, candidate.ops, candidate.boundary, proposed);
@@ -2052,6 +2122,19 @@ CandidateGroup BuildBestCandidateWithScheduler(
         candidate.scheduler = RunSchedulerAnalysis(
             problem, graph, candidate.ops, candidate.boundary,
             candidate.granularity);
+    }
+
+    // ISOA correction: if the evaluator-computed working set exceeds capacity,
+    // try the ISOA-reduced estimate to allow the candidate to survive retain
+    // choices in DP (IsCapacityFeasible uses candidate.metrics.working_set_bytes).
+    if (candidate.metrics.valid && is_linear &&
+        candidate.metrics.working_set_bytes > problem.fast_memory_capacity) {
+        const int64_t isoa_ws = ISOAAwareWorkingSetBytes(
+            problem, graph, candidate.ops, candidate.boundary,
+            candidate.granularity, true);
+        if (isoa_ws < candidate.metrics.working_set_bytes) {
+            candidate.metrics.working_set_bytes = isoa_ws;
+        }
     }
 
     return candidate;
@@ -3589,6 +3672,316 @@ static std::vector<CandidateGroup> RecoverFrontierSchedule(
     return schedule;
 }
 
+// ============================================================================
+// GRAPH-CUT DECOMPOSITION
+// ============================================================================
+
+// Returns sorted list of topo positions P where prefix_max_succ[P] == P.
+// "prefix_max[i]" = max over j in [0..i] of max(topo_pos[succ] for succ in
+// succs[topo_order[j]], and i itself).  When prefix_max[P] == P, op P is a
+// DAG sink within [0..P]: it has no successors, so no edge crosses position P.
+// Cut means: left segment [lo..P], right segment [P+1..N-1].
+// No fusion candidate can span a natural cut → decomposition is lossless.
+std::vector<size_t> FindNaturalCuts(const OpGraph& graph) {
+    const size_t n = graph.topo_order.size();
+    if (n <= 1) return {};
+    std::vector<size_t> prefix_max(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        size_t m = (i > 0) ? prefix_max[i - 1] : 0;
+        const size_t op_id = graph.topo_order[i];
+        for (size_t succ : graph.succs[op_id]) {
+            m = std::max(m, graph.topo_pos[succ]);
+        }
+        prefix_max[i] = std::max(m, i);
+    }
+    std::vector<size_t> cuts;
+    for (size_t p = 0; p + 1 < n; ++p) {
+        if (prefix_max[p] == p) cuts.push_back(p);
+    }
+    return cuts;
+}
+
+// Returns a set of cut positions by scanning for the best cut opportunity
+// within each chunk of max_seg_size ops (the "chunk cut" strategy).
+//
+// For each chunk boundary region, find the position P in a window around the
+// ideal cut point that minimizes the number of "crossing edges" — i.e., edges
+// from [0..P] to [P+1..N-1].  The position with the fewest crossing edges is
+// chosen as the cut.  Ops at or near the cut with crossing edges are scheduled
+// as singletons to avoid quality loss.
+//
+// This always produces cuts regardless of graph structure, enabling
+// decomposition even for dense DAGs where strict natural cuts don't exist.
+// The quality impact is bounded: a crossing edge means one op spans the cut
+// boundary; if we schedule that op as a singleton, the solution still covers
+// all ops.  The optimizer may miss fusing that op with its successor, but
+// this is a controlled tradeoff for runtime.
+std::vector<size_t> FindChunkCuts(const OpGraph& graph, size_t max_seg_size) {
+    const size_t n = graph.topo_order.size();
+    if (n <= max_seg_size) return {};
+
+    // Precompute prefix_max_succ[i] = max topo_pos of any successor of any
+    // op in [0..i] (or i itself if no successors).
+    std::vector<size_t> prefix_max(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        size_t m = (i > 0) ? prefix_max[i - 1] : 0;
+        const size_t op_id = graph.topo_order[i];
+        for (size_t succ : graph.succs[op_id]) {
+            m = std::max(m, graph.topo_pos[succ]);
+        }
+        prefix_max[i] = std::max(m, i);
+    }
+
+    // Count crossing edges at each candidate cut position P:
+    // crossing(P) = number of ops in [0..P] with at least one successor
+    //               in [P+1..N-1].
+    // = number of i in [0..P] where prefix_max(i's own successors) > P
+    // We can compute this efficiently with a difference array.
+    //
+    // crossing(P) = number of i <= P where max_succ_topo[i] > P.
+    // Precompute max_succ_topo[i] = max topo_pos among direct successors of
+    // topo_order[i] (or i if no successors).
+    std::vector<size_t> max_succ(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        size_t m = i;  // default: no successor, contributes 0 crossing for cuts > i
+        const size_t op_id = graph.topo_order[i];
+        for (size_t succ : graph.succs[op_id]) {
+            m = std::max(m, graph.topo_pos[succ]);
+        }
+        max_succ[i] = m;
+    }
+
+    // crossing(P) = #{i in [0..P] : max_succ[i] > P}
+    // We find the best cut in each window [ideal-window/2 .. ideal+window/2].
+    const size_t window = std::max<size_t>(4, max_seg_size / 4);
+    std::vector<size_t> cuts;
+    size_t seg_start = 0;
+
+    while (seg_start + max_seg_size < n) {
+        // Ideal cut: seg_start + max_seg_size - 1
+        const size_t ideal = seg_start + max_seg_size - 1;
+        const size_t search_lo = (ideal > window) ? (ideal - window) : seg_start;
+        const size_t search_hi = std::min(ideal + window, n - 2);
+
+        // Find P in [search_lo, search_hi] minimizing crossing(P).
+        // Then minimize further by preferring P closer to ideal.
+        size_t best_p = ideal;
+        size_t best_cross = std::numeric_limits<size_t>::max();
+        for (size_t p = search_lo; p <= search_hi; ++p) {
+            // Count crossings for cut at P
+            size_t cross = 0;
+            for (size_t i = seg_start; i <= p; ++i) {
+                if (max_succ[i] > p) ++cross;
+            }
+            if (cross < best_cross ||
+                (cross == best_cross &&
+                 (p > best_p ? p - ideal : ideal - p) <
+                 (best_p > ideal ? best_p - ideal : ideal - best_p))) {
+                best_cross = cross;
+                best_p = p;
+            }
+        }
+        cuts.push_back(best_p);
+        seg_start = best_p + 1;
+    }
+    return cuts;
+}
+
+// Produces an OpGraph restricted to ops at topo positions [lo..hi] in
+// full_graph, with topo positions remapped to [0..hi-lo].  Edges outside the
+// segment are dropped.  Tensors produced outside the segment have
+// producer_of_tensor[t] = -1 so ComputeBoundary treats them as graph inputs.
+OpGraph ExtractSubgraph(const Problem& problem,
+                        const OpGraph& full_graph,
+                        size_t lo, size_t hi) {
+    (void)problem;
+    const size_t seg_n = hi - lo + 1;
+    const size_t num_ops = full_graph.preds.size();
+    OpGraph sub;
+
+    // 1. Topo order (remapped indices 0..seg_n-1)
+    sub.topo_order.resize(seg_n);
+    for (size_t i = 0; i < seg_n; ++i)
+        sub.topo_order[i] = full_graph.topo_order[lo + i];
+
+    std::unordered_set<size_t> seg_set(sub.topo_order.begin(), sub.topo_order.end());
+
+    // 2. topo_pos remapped; only segment op entries are meaningful
+    sub.topo_pos.assign(num_ops, 0);
+    for (size_t i = 0; i < seg_n; ++i)
+        sub.topo_pos[sub.topo_order[i]] = i;
+
+    // 3. preds / succs: intra-segment edges only
+    sub.preds.assign(num_ops, {});
+    sub.succs.assign(num_ops, {});
+    for (size_t i = 0; i < seg_n; ++i) {
+        const size_t op_id = sub.topo_order[i];
+        for (size_t pred : full_graph.preds[op_id])
+            if (seg_set.count(pred)) sub.preds[op_id].push_back(pred);
+        for (size_t succ : full_graph.succs[op_id])
+            if (seg_set.count(succ)) sub.succs[op_id].push_back(succ);
+    }
+
+    // 4. producer_of_tensor: -1 for tensors produced outside [lo..hi]
+    sub.producer_of_tensor = full_graph.producer_of_tensor;
+    for (size_t t = 0; t < sub.producer_of_tensor.size(); ++t) {
+        const int prod = sub.producer_of_tensor[t];
+        if (prod >= 0 && !seg_set.count(static_cast<size_t>(prod)))
+            sub.producer_of_tensor[t] = -1;
+    }
+
+    // 5. consumers_of_tensor: segment ops only
+    sub.consumers_of_tensor.assign(full_graph.consumers_of_tensor.size(), {});
+    for (size_t t = 0; t < full_graph.consumers_of_tensor.size(); ++t)
+        for (size_t c : full_graph.consumers_of_tensor[t])
+            if (seg_set.count(c)) sub.consumers_of_tensor[t].push_back(c);
+
+    return sub;
+}
+
+// Runs the appropriate DP for a sub-graph segment and returns an ordered
+// schedule (vector of CandidateGroups).  Returns empty on failure; caller
+// should fall back to the full-graph DP.
+// Dispatches: bitmask DP for seg_n <= 20, frontier DP for seed-growth,
+// positional DP as final fallback.
+std::vector<CandidateGroup> SolveSegment(
+    const Problem& problem,
+    const OpGraph& sub_graph,
+    const OptimusConfig& config) {
+
+    const size_t seg_n = sub_graph.topo_order.size();
+    if (seg_n == 0) return {};
+
+    // Trivial single-op case
+    if (seg_n == 1) {
+        CandidateGroup cg = BuildBestCandidate(
+            problem, sub_graph, size_t{0}, size_t{0}, config);
+        if (cg.metrics.valid) return {std::move(cg)};
+        return {};
+    }
+
+    // Generate candidates for this segment
+    std::vector<std::vector<CandidateGroup>> seg_cands;
+    if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth) {
+        OptimusConfig seg_cfg = config;
+        seg_cfg.allow_noncontig_groups = true;
+        seg_cands = GenerateSeedGrowthCandidates(problem, sub_graph, seg_cfg);
+    } else {
+        seg_cands = GenerateCandidates(problem, sub_graph, config);
+    }
+
+    // Helper: add singleton fallbacks for any uncovered bitmask position
+    auto add_bitmask_singletons = [&](std::vector<BitmaskGroup>& bgs) {
+        std::unordered_set<int> covered_v0;
+        for (const auto& bg : bgs) covered_v0.insert(bg.v0_topo_idx);
+        for (size_t i = 0; i < seg_n; ++i) {
+            if (covered_v0.count(static_cast<int>(i))) continue;
+            CandidateGroup fb = BuildBestCandidate(problem, sub_graph, i, i, config);
+            if (!fb.metrics.valid) continue;
+            BitmaskGroup bg;
+            bg.mask = (1ULL << i);
+            bg.v0_topo_idx = static_cast<int>(i);
+            bg.candidate = std::move(fb);
+            bgs.push_back(std::move(bg));
+        }
+    };
+
+    auto add_frontier_singletons = [&](std::vector<FrontierGroup>& fgs) {
+        std::unordered_set<size_t> covered;
+        for (const auto& fg : fgs) {
+            size_t cnt = 0;
+            for (uint64_t w : fg.mask) cnt += __builtin_popcountll(w);
+            if (cnt == 1 &&
+                FrontierTestBit(fg.mask, static_cast<size_t>(fg.v0_topo_idx)))
+                covered.insert(static_cast<size_t>(fg.v0_topo_idx));
+        }
+        for (size_t i = 0; i < seg_n; ++i) {
+            if (covered.count(i)) continue;
+            CandidateGroup fb = BuildBestCandidate(problem, sub_graph, i, i, config);
+            if (!fb.metrics.valid) continue;
+            FrontierGroup fg;
+            fg.mask.assign(FrontierNumWords(seg_n), 0ULL);
+            FrontierSetBit(fg.mask, i);
+            fg.v0_topo_idx = static_cast<int>(i);
+            fg.candidate = std::move(fb);
+            fgs.push_back(std::move(fg));
+        }
+    };
+
+    // --- Bitmask DP (seg_n <= 20) ---
+    if (seg_n <= 20) {
+        std::vector<BitmaskGroup> bgs = BuildBitmaskGroups(sub_graph, seg_cands);
+        add_bitmask_singletons(bgs);
+        std::vector<std::vector<size_t>> by_v0(seg_n);
+        for (size_t i = 0; i < bgs.size(); ++i) {
+            const int v0 = bgs[i].v0_topo_idx;
+            if (v0 >= 0 && static_cast<size_t>(v0) < seg_n) by_v0[v0].push_back(i);
+        }
+        const uint64_t full = (seg_n == 64u) ? ~0ULL : ((1ULL << seg_n) - 1u);
+        std::unordered_map<uint64_t, BitmaskDecision> bm;
+        const double cost = SolveBitmaskDPImpl(
+            problem, sub_graph, bgs, by_v0, seg_n, 0, full, &bm);
+        if (std::isfinite(cost)) {
+            auto sched = RecoverBitmaskSchedule(bgs, full, bm);
+            if (!sched.empty()) return sched;
+        }
+        // Fall through to positional DP
+
+    } else if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth) {
+        // --- Frontier DP (seg_n > 20, seed-growth) ---
+        std::vector<FrontierGroup> fgs = BuildFrontierGroups(sub_graph, seg_cands);
+        add_frontier_singletons(fgs);
+        std::vector<std::vector<size_t>> by_v0(seg_n);
+        for (size_t i = 0; i < fgs.size(); ++i) {
+            const int v0 = fgs[i].v0_topo_idx;
+            if (v0 >= 0 && static_cast<size_t>(v0) < seg_n) by_v0[v0].push_back(i);
+        }
+        std::vector<uint64_t> full_mask(FrontierNumWords(seg_n), 0ULL);
+        for (size_t i = 0; i < seg_n; ++i) FrontierSetBit(full_mask, i);
+        std::vector<uint64_t> zero(FrontierNumWords(seg_n), 0ULL);
+        size_t memo_cap = 10000000;
+        if (const char* e = std::getenv("MLSYS_OPTIMUS_FRONTIER_MEMO_CAP")) {
+            const long v = std::atol(e);
+            if (v > 0) memo_cap = static_cast<size_t>(v);
+        }
+        std::unordered_map<std::vector<uint64_t>, FrontierDecision,
+                           FrontierMaskHash> fm;
+        const double cost = SolveFrontierDPImpl(
+            problem, sub_graph, fgs, by_v0, seg_n,
+            zero, full_mask, memo_cap, &fm);
+        if (std::isfinite(cost)) {
+            auto sched = RecoverFrontierSchedule(fgs, full_mask, fm);
+            if (!sched.empty()) return sched;
+        }
+        // Fall through to positional DP
+    }
+
+    // --- Positional DP fallback ---
+    std::vector<std::unordered_set<size_t>> useful(seg_n);
+    for (size_t s = 0; s < seg_n; ++s)
+        for (const auto& c : seg_cands[s])
+            useful[s].insert(c.boundary.boundary_inputs.begin(),
+                              c.boundary.boundary_inputs.end());
+    std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash> pm;
+    (void)SolveFromState(problem, sub_graph, seg_cands, useful, 0, {}, &pm);
+
+    // Recover positional schedule by walking the memo forward
+    std::vector<CandidateGroup> pos_sched;
+    size_t pos_start = 0;
+    std::vector<size_t> retained;
+    while (pos_start < seg_cands.size()) {
+        const SearchStateKey key{
+            pos_start, CanonicalizeRetainedInputs(retained, useful[pos_start])};
+        auto it = pm.find(key);
+        if (it == pm.end() || !it->second.valid ||
+            it->second.candidate_index >= seg_cands[pos_start].size()) break;
+        pos_sched.push_back(seg_cands[pos_start][it->second.candidate_index]);
+        retained = it->second.retained_outputs;
+        pos_start = pos_sched.back().end + 1;
+    }
+    return pos_sched;
+}
+
 }  // namespace
 
 Solution SolveWithOptimusImpl(const Problem& problem, const OptimusConfig& config) {
@@ -3852,18 +4245,86 @@ Solution SolveWithPaperOptimus(const Problem& problem) {
     OptimusConfig config;
     config.candidate_mode = GetCandidateGenerationMode();
     config.guidance_mode = GuidanceMode::kContest;
+    if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth)
+        config.allow_noncontig_groups = true;
 
-    // Generate candidates. Dispatch on candidate_mode so seed-growth (which
-    // produces DAG-aware, possibly non-topologically-contiguous groups)
-    // reaches the bitmask/frontier set-cover DP instead of being silently
-    // replaced by interval-only candidates.
-    // AddAnalyticalTileCandidates is already injected into BuildBestCandidate,
-    // so all candidates benefit from Paper Eq. 4 tile sizing.
+    // === Graph-cut decomposition: split at natural or chunk cuts ===
+    // Detect cuts BEFORE generating candidates: if we take the decomposition
+    // path each segment generates its own candidates (cheaper, local), so we
+    // avoid wasting time on full-graph candidate generation.
+    // Strategy 1: Natural cuts (lossless — no edge crosses the cut).
+    // Strategy 2: Chunk cuts at positions with fewest crossing edges (heuristic).
+    // Both strategies fall back to full DP if any segment fails.
+    if (n > 20) {
+        // Determine max segment size: aim for ~25 ops per segment so each
+        // segment uses the fast bitmask DP (O(2^seg_n)).  Overridable via env.
+        size_t max_seg = 25;
+        if (const char* e = std::getenv("MLSYS_OPTIMUS_MAX_SEG_SIZE")) {
+            const long v = std::atol(e);
+            if (v > 0) max_seg = static_cast<size_t>(v);
+        }
+
+        std::vector<size_t> cuts = FindNaturalCuts(graph);
+        const char* cut_type = "natural";
+        if (cuts.empty()) {
+            cuts = FindChunkCuts(graph, max_seg);
+            cut_type = "chunk";
+        }
+
+        if (!cuts.empty()) {
+            std::cerr << "Optimus paper: found " << cuts.size()
+                      << " " << cut_type << " cuts\n";
+
+            // Build segments: [0..c0], [c0+1..c1], ..., [c_{k-1}+1..n-1]
+            std::vector<std::pair<size_t, size_t>> segments;
+            size_t prev = 0;
+            for (size_t cut : cuts) {
+                segments.push_back({prev, cut});
+                prev = cut + 1;
+            }
+            segments.push_back({prev, n - 1});
+
+            for (size_t i = 0; i < segments.size(); ++i) {
+                std::cerr << "Optimus paper: segment " << i
+                          << " size="
+                          << (segments[i].second - segments[i].first + 1)
+                          << " topo=[" << segments[i].first
+                          << ".." << segments[i].second << "]\n";
+            }
+
+            std::vector<CandidateGroup> full_sched;
+            bool decomp_ok = true;
+            for (const auto& [lo, hi] : segments) {
+                OpGraph sub = ExtractSubgraph(problem, graph, lo, hi);
+                auto seg_sched = SolveSegment(problem, sub, config);
+                if (seg_sched.empty()) {
+                    std::cerr << "Optimus paper: segment [" << lo << ".."
+                              << hi << "] solve failed, falling back to "
+                                 "full DP\n";
+                    decomp_ok = false;
+                    break;
+                }
+                for (auto& cg : seg_sched)
+                    full_sched.push_back(std::move(cg));
+            }
+            if (decomp_ok && !full_sched.empty()) {
+                Solution sol = BuildSolutionFromSchedule(problem, full_sched);
+                if (!sol.subgraphs.empty()) {
+                    std::cerr << "Optimus paper: decomposition succeeded ("
+                              << sol.subgraphs.size() << " subgraphs)\n";
+                    return sol;
+                }
+            }
+            std::cerr << "Optimus paper: decomposition fallback to full DP\n";
+        }
+    }
+    // === End graph-cut decomposition ===
+
+    // Generate candidates for the full-graph DP path.
+    // This runs only when: N<=20 (no decomposition attempted), no cuts found,
+    // or decomposition failed and we fell through to here.
     std::vector<std::vector<CandidateGroup>> candidates;
     if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth) {
-        // Allow non-contiguous candidates because the bitmask/frontier DP
-        // handles them correctly via a set-cover formulation.
-        config.allow_noncontig_groups = true;
         std::cerr << "Optimus paper: seed-growth candidates (non-contig allowed)\n";
         candidates = GenerateSeedGrowthCandidates(problem, graph, config);
     } else {
