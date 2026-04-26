@@ -8,21 +8,31 @@
 #include "solver.h"
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
+    if (argc != 3 && argc != 4) {
         std::cerr << "Usage: " << argv[0] << " <input.json> <output.json>\n";
+        std::cerr << "       " << argv[0] << " <input.json> <solution_in.json> <output.json>  (eval-only)\n";
         return 1;
     }
 
-    std::string input_path = argv[1];
-    std::string output_path = argv[2];
+    // eval-only mode: read existing solution, skip solver
+    const bool eval_only = (argc == 4);
+    std::string input_path  = argv[1];
+    std::string eval_input  = eval_only ? argv[2] : "";
+    std::string output_path = eval_only ? argv[3] : argv[2];
 
     try {
         // Parse the problem
         auto problem = mlsys::ReadProblem(input_path);
         std::cerr << "Loaded problem from: " << input_path << "\n";
 
-        // Solve
-        auto solution = mlsys::Solve(problem);
+        // Solve (or load pre-built solution)
+        mlsys::Solution solution;
+        if (eval_only) {
+            solution = mlsys::ReadSolution(eval_input);
+            std::cerr << "Loaded solution from: " << eval_input << "\n";
+        } else {
+            solution = mlsys::Solve(problem);
+        }
 
         // Print solution summary.
         std::set<size_t> covered_ops;

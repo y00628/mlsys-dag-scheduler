@@ -97,18 +97,28 @@ Solve()
 
 ### Best config: `optimus_paper` + `seed` (with graph-cut decomposition)
 
-| Benchmark | N ops | Latency | Wall time |
-|---|---:|---:|---:|
-| mlsys-2026-1 | 5 | 405,875 | <1s |
-| mlsys-2026-5 | 19 | 759,125 | <1s |
-| mlsys-2026-9 | 32 | 164,506,000 | ~43s |
-| mlsys-2026-13 | 63 | 166,404,000 | ~9s |
-| mlsys-2026-17 | 103 | 46,338,000 | ~2s |
+| Benchmark | N ops | Latency | Wall time | Key improvement |
+|---|---:|---:|---:|---|
+| mlsys-2026-1 | 5 | 405,875 | <1s | — |
+| mlsys-2026-5 | 19 | **650,528** | <1s | epilogue fusion [op5,6],[op10,11] + max-height gran fix |
+| mlsys-2026-9 | 32 | 164,506,000 | ~43s | graph-cut decomposition |
+| mlsys-2026-13 | 63 | 166,403,000 | ~9s | graph-cut decomposition |
+| mlsys-2026-17 | 103 | 46,338,000 | ~2s | graph-cut decomposition |
 
 Run with:
 ```bash
 MLSYS_SOLVER=optimus_paper MLSYS_OPTIMUS_CANDIDATES=seed ./build/mlsys benchmarks/mlsys-2026-N.json outputs/out-N.json
 ```
+
+### Key optimizations applied
+
+| Optimization | File | Effect |
+|---|---|---|
+| `BuildBestCandidate` forced max-height evaluation | `optimus.cpp` | Ensures optimal large-h/small-k tiles are always scored by accurate evaluator; fixed BM-5 by 2.2% |
+| Epilogue fusion [MatMul, Pointwise] | `optimus.cpp` (seed-growth candidates) | Fuses op5+op6, op10+op11 in BM-5; saves t15/t20 slow-mem round-trip |
+| Graph-cut decomposition | `optimus.cpp` | Splits large DAGs into independent segments; dramatically reduces wall time for BM-9/13/17 |
+| Frontier DP | `optimus.cpp` | Handles segments with N>20 ops that exceed bitmask DP limit |
+| Pre-op fusion (opt-in) | `optimus.cpp` | `MLSYS_ENABLE_PREOP_FUSION=1` allows [Pointwise, MatMul] pattern (disabled by default) |
 
 ### Baseline: `optimus` + `interval`
 

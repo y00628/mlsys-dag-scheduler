@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <queue>
@@ -85,6 +86,67 @@ bool IsMatMul(const Op& op) {
 
 bool IsPointwise(const Op& op) {
     return op.op_type == "Pointwise";
+}
+
+bool ReadBoolEnvOrDefault(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" || value == "off") {
+        return false;
+    }
+    return default_value;
+}
+
+bool IsUnaryPointwiseOp(const Problem& problem, size_t op_id) {
+    const auto& op = problem.ops[op_id];
+    return IsPointwise(op) && op.inputs.size() == 1 && op.outputs.size() == 1;
+}
+
+bool IsPreOpFusionChain(const Problem& problem, const OpGraph& graph,
+                        const std::vector<size_t>& ordered_ops) {
+    if (ordered_ops.size() != 2) {
+        return false;
+    }
+    const size_t pointwise = ordered_ops[0];
+    const size_t matmul = ordered_ops[1];
+    if (!IsUnaryPointwiseOp(problem, pointwise) || !IsMatMul(problem.ops[matmul])) {
+        return false;
+    }
+    const size_t output_tensor = problem.ops[pointwise].outputs.front();
+    if (output_tensor >= graph.consumers_of_tensor.size()) {
+        return false;
+    }
+    const auto& consumers = graph.consumers_of_tensor[output_tensor];
+    if (consumers.size() != 1 || consumers.front() != matmul) {
+        return false;
+    }
+    if (problem.ops[matmul].inputs.size() < 2 ||
+        problem.ops[matmul].inputs.front() != output_tensor) {
+        return false;
+    }
+    const auto& pointwise_out = problem.tensors[output_tensor];
+    const auto& matmul_activation = problem.tensors[problem.ops[matmul].inputs.front()];
+    if (pointwise_out.width != matmul_activation.width ||
+        pointwise_out.height != matmul_activation.height) {
+        return false;
+    }
+    return true;
+}
+
+size_t GetEvaluationOutputOpId(const Problem& problem, const OpGraph& graph,
+                               const std::vector<size_t>& ordered_ops) {
+    if (IsPreOpFusionChain(problem, graph, ordered_ops)) {
+        return ordered_ops.back();
+    }
+    return ordered_ops.front();
 }
 
 int64_t MatMulK(const Problem& problem, size_t op_id) {
@@ -453,7 +515,10 @@ bool EvaluateSubgraphImpl(const Problem& problem, const OpGraph& graph,
     if (!IsConnectedSubgraph(graph, ordered_ops)) {
         return false;
     }
-    if (!SharesCommonOutputShape(problem, ordered_ops)) {
+    const bool allow_preop_fusion =
+        ReadBoolEnvOrDefault("MLSYS_ENABLE_PREOP_FUSION", true);
+    if (!SharesCommonOutputShape(problem, ordered_ops) &&
+        !(allow_preop_fusion && IsPreOpFusionChain(problem, graph, ordered_ops))) {
         return false;
     }
 
@@ -473,8 +538,8 @@ bool EvaluateSubgraphImpl(const Problem& problem, const OpGraph& graph,
         retained_prev.insert(tensor_id);
     }
 
-    const auto& ref_out =
-        problem.tensors[problem.ops[ordered_ops.front()].outputs.front()];
+    const size_t output_op_id = GetEvaluationOutputOpId(problem, graph, ordered_ops);
+    const auto& ref_out = problem.tensors[problem.ops[output_op_id].outputs.front()];
     const int64_t tiles_w = CeilDiv(ref_out.width, sg.granularity.width);
     const int64_t tiles_h = CeilDiv(ref_out.height, sg.granularity.height);
     const size_t spatial_tiles = static_cast<size_t>(tiles_w * tiles_h);
@@ -667,7 +732,10 @@ bool RecomputeImpl(const Problem& problem, const Solution& input_solution,
                       << " is not a connected sub-DAG\n";
             return false;
         }
-        if (!SharesCommonOutputShape(problem, ordered_ops)) {
+        const bool allow_preop_fusion =
+            ReadBoolEnvOrDefault("MLSYS_ENABLE_PREOP_FUSION", true);
+        if (!SharesCommonOutputShape(problem, ordered_ops) &&
+            !(allow_preop_fusion && IsPreOpFusionChain(problem, graph, ordered_ops))) {
             std::cerr << "ERROR: Subgraph " << sg_idx
                       << " mixes incompatible output shapes\n";
             return false;

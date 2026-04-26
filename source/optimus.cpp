@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -285,6 +286,7 @@ struct LegalityPolicyConfig {
     bool enable_l3_policy = true;
     bool enforce_common_output_shape = true;
     bool enforce_internalized_multi_op = true;
+    bool allow_preop_fusion = false;
 };
 
 std::unordered_map<ScoreCacheKey, GroupMetrics, ScoreCacheKeyHash> g_score_cache;
@@ -336,6 +338,45 @@ bool IsMatMul(const Op& op) {
 
 bool IsPointwise(const Op& op) {
     return op.op_type == "Pointwise";
+}
+
+bool IsUnaryPointwiseOp(const Problem& problem, size_t op_id) {
+    const auto& op = problem.ops[op_id];
+    return IsPointwise(op) && op.inputs.size() == 1 && op.outputs.size() == 1;
+}
+
+bool IsPreOpFusionPattern(const Problem& problem, const OpGraph& graph,
+                          const std::vector<size_t>& ordered_ops) {
+    if (ordered_ops.size() != 2) {
+        return false;
+    }
+    const size_t pointwise = ordered_ops[0];
+    const size_t matmul = ordered_ops[1];
+    if (!IsUnaryPointwiseOp(problem, pointwise) || !IsMatMul(problem.ops[matmul])) {
+        return false;
+    }
+    const auto& out_tensor = problem.ops[pointwise].outputs.front();
+    if (out_tensor >= graph.consumers_of_tensor.size()) {
+        return false;
+    }
+    const auto& consumers = graph.consumers_of_tensor[out_tensor];
+    if (consumers.size() != 1 || consumers.front() != matmul) {
+        return false;
+    }
+    if (problem.ops[matmul].inputs.empty() ||
+        problem.ops[matmul].inputs.front() != out_tensor) {
+        return false;
+    }
+    if (problem.ops[matmul].inputs.size() < 2) {
+        return false;
+    }
+    const auto& pointwise_out = problem.tensors[out_tensor];
+    const auto& matmul_activation = problem.tensors[problem.ops[matmul].inputs.front()];
+    if (pointwise_out.width != matmul_activation.width ||
+        pointwise_out.height != matmul_activation.height) {
+        return false;
+    }
+    return true;
 }
 
 bool ContainsMatMul(const Problem& problem, const std::vector<size_t>& ops) {
@@ -442,6 +483,8 @@ LegalityPolicyConfig GetLegalityPolicyConfig() {
         "MLSYS_OPTIMUS_LEGALITY_ENFORCE_COMMON_OUTPUT_SHAPE", false);
     config.enforce_internalized_multi_op = ReadBoolEnvOrDefault(
         "MLSYS_OPTIMUS_LEGALITY_ENFORCE_INTERNALIZED_MULTI_OP", true);
+    config.allow_preop_fusion =
+        ReadBoolEnvOrDefault("MLSYS_ENABLE_PREOP_FUSION", false);
     return config;
 }
 
@@ -1670,7 +1713,9 @@ bool RunStaticLegalityChecks(const Problem& problem, const OpGraph& graph,
 
     if (policy.enable_l3_policy) {
         if (policy.enforce_common_output_shape &&
-            !SharesCommonOutputShape(problem, candidate->ops)) {
+            !SharesCommonOutputShape(problem, candidate->ops) &&
+            !(policy.allow_preop_fusion &&
+              IsPreOpFusionPattern(problem, graph, candidate->ops))) {
             candidate->legality.is_valid = false;
             candidate->legality.level_passed = LegalityLevel::kL1Execution;
             candidate->legality.failed_level = LegalityLevel::kL3Policy;
@@ -1896,22 +1941,63 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         return candidate;
     }
 
-    const size_t budget = ComputeRefineBudget(proxy_ranked, candidate.ops.size());
-    for (size_t i = 0; i < budget; ++i) {
+    // Helper lambda: evaluate one granularity and update best if improved.
+    auto try_granularity = [&](const Granularity& g) {
+        const int64_t ws =
+            EstimateWorkingSetBytes(problem, graph, candidate.ops,
+                                   candidate.boundary, g);
+        if (ws > problem.fast_memory_capacity) {
+            return;
+        }
         GroupMetrics metrics = EvaluateGroup(problem, graph, candidate.ops,
-                                             candidate.boundary,
-                                             proxy_ranked[i].second,
+                                             candidate.boundary, g,
                                              &candidate.legality);
         if (!metrics.valid) {
-            continue;
+            return;
         }
         if (!candidate.metrics.valid || metrics.latency < candidate.metrics.latency) {
-            candidate.granularity = proxy_ranked[i].second;
+            candidate.granularity = g;
             candidate.metrics = metrics;
             candidate.legality.is_valid = true;
             candidate.legality.level_passed = LegalityLevel::kL3Policy;
             candidate.legality.reason = LegalityReason::kNone;
             candidate.legality.failed_level = LegalityLevel::kL0Graph;
+        }
+    };
+
+    const size_t budget = ComputeRefineBudget(proxy_ranked, candidate.ops.size());
+    for (size_t i = 0; i < budget && i < proxy_ranked.size(); ++i) {
+        try_granularity(proxy_ranked[i].second);
+    }
+
+    // Always evaluate "full-width, max-height" tiles at each k-step.
+    // The proxy model underestimates LRU benefits of large-h/small-k tiles,
+    // so these may not reach the budget despite being near-optimal.
+    {
+        std::set<int64_t> k_set;
+        for (const auto& [score, g] : proxy_ranked) {
+            k_set.insert(g.depth);
+        }
+        for (int64_t k_step : k_set) {
+            if (k_step <= 0) {
+                continue;
+            }
+            // Binary search for max gran_h at full output width.
+            int64_t lo = 1, hi = ref_out.height;
+            while (lo < hi) {
+                const int64_t mid = lo + (hi - lo + 1) / 2;
+                const Granularity test_g{ref_out.width, mid, k_step};
+                if (EstimateWorkingSetBytes(problem, graph, candidate.ops,
+                                            candidate.boundary, test_g) <=
+                    problem.fast_memory_capacity) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if (lo > 0) {
+                try_granularity({ref_out.width, lo, k_step});
+            }
         }
     }
 
@@ -2168,6 +2254,244 @@ size_t EstimateMaxGroupSize(const Problem& problem) {
         return 6;
     }
     return kDefaultMaxGroupSize;
+}
+
+void DedupCandidateBucket(std::vector<CandidateGroup>* bucket) {
+    if (bucket == nullptr || bucket->empty()) {
+        return;
+    }
+    std::sort(bucket->begin(), bucket->end(),
+              [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                  if (lhs.ops == rhs.ops) {
+                      return lhs.metrics.latency < rhs.metrics.latency;
+                  }
+                  return lhs.ops < rhs.ops;
+              });
+    bucket->erase(
+        std::unique(bucket->begin(), bucket->end(),
+                    [](const CandidateGroup& lhs, const CandidateGroup& rhs) {
+                        return lhs.ops == rhs.ops;
+                    }),
+        bucket->end());
+}
+
+std::vector<std::vector<size_t>> DetectSpecialPatternOpSets(
+    const Problem& problem, const OpGraph& graph) {
+    std::vector<std::vector<size_t>> patterns;
+    std::unordered_set<std::vector<size_t>, OpVectorHash> seen;
+    const bool allow_preop_fusion =
+        ReadBoolEnvOrDefault("MLSYS_ENABLE_PREOP_FUSION", false);
+
+    auto add_pattern = [&](std::vector<size_t> ops) {
+        if (ops.size() < 2) {
+            return;
+        }
+        std::sort(ops.begin(), ops.end(),
+                  [&](size_t lhs, size_t rhs) {
+                      return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+                  });
+        ops.erase(std::unique(ops.begin(), ops.end()), ops.end());
+        if (ops.size() < 2) {
+            return;
+        }
+        if (seen.insert(ops).second) {
+            patterns.push_back(std::move(ops));
+        }
+    };
+
+    // P1: activation epilogue chains seeded from MatMul outputs.
+    // We keep the chain linear and unary so the candidate stays cheap to score.
+    constexpr size_t kMaxEpilogueDepth = 4;
+    for (size_t seed = 0; seed < graph.topo_order.size(); ++seed) {
+        if (!IsMatMul(problem.ops[graph.topo_order[seed]])) {
+            continue;
+        }
+        std::vector<size_t> path = {graph.topo_order[seed]};
+        std::function<void()> dfs = [&]() {
+            if (path.size() >= 2) {
+                add_pattern(path);
+            }
+            if (path.size() >= kMaxEpilogueDepth) {
+                return;
+            }
+            const size_t last = path.back();
+            for (size_t succ : graph.succs[last]) {
+                if (!IsUnaryPointwiseOp(problem, succ)) {
+                    continue;
+                }
+                if (graph.preds[succ].size() != 1 || graph.preds[succ][0] != last) {
+                    continue;
+                }
+                if (std::find(path.begin(), path.end(), succ) != path.end()) {
+                    continue;
+                }
+                path.push_back(succ);
+                dfs();
+                path.pop_back();
+            }
+        };
+        dfs();
+    }
+
+    // P1: RoPE-style MatMul -> Pointwise -> MatMul triples.
+    for (size_t matmul_a = 0; matmul_a < graph.topo_order.size(); ++matmul_a) {
+        size_t op_a = graph.topo_order[matmul_a];
+        if (!IsMatMul(problem.ops[op_a])) {
+            continue;
+        }
+        for (size_t mid : graph.succs[op_a]) {
+            if (!IsUnaryPointwiseOp(problem, mid)) {
+                continue;
+            }
+            if (graph.preds[mid].size() != 1 || graph.preds[mid][0] != op_a) {
+                continue;
+            }
+            for (size_t op_c : graph.succs[mid]) {
+                if (!IsMatMul(problem.ops[op_c])) {
+                    continue;
+                }
+                if (op_c == op_a) {
+                    continue;
+                }
+                add_pattern({op_a, mid, op_c});
+            }
+        }
+    }
+
+    if (allow_preop_fusion) {
+        // P3: RMSNorm-like pre-op fusion.  Keep this intentionally narrow:
+        // a unary Pointwise directly feeding a MatMul.
+        for (size_t pointwise = 0; pointwise < graph.topo_order.size(); ++pointwise) {
+            size_t op_id = graph.topo_order[pointwise];
+            if (!IsUnaryPointwiseOp(problem, op_id)) {
+                continue;
+            }
+            for (size_t succ : graph.succs[op_id]) {
+                if (!IsMatMul(problem.ops[succ])) {
+                    continue;
+                }
+                if (graph.preds[succ].size() < 1) {
+                    continue;
+                }
+                const size_t output_tensor = problem.ops[op_id].outputs.front();
+                if (graph.consumers_of_tensor[output_tensor].size() != 1) {
+                    continue;
+                }
+                if (graph.consumers_of_tensor[output_tensor][0] != succ) {
+                    continue;
+                }
+                if (problem.ops[succ].inputs.empty() ||
+                    problem.ops[succ].inputs.front() != output_tensor) {
+                    continue;
+                }
+                add_pattern({op_id, succ});
+            }
+        }
+    }
+
+    // P4: MoE-style routing fan-out.  We conservatively look for a router
+    // output tensor that is consumed by multiple MatMul experts.  This keeps
+    // the candidate connected without assuming a particular routing op type.
+    constexpr size_t kMinExpertBranches = 2;
+    for (size_t op_id = 0; op_id < problem.ops.size(); ++op_id) {
+        const auto& op = problem.ops[op_id];
+        if (op.outputs.empty()) {
+            continue;
+        }
+        for (size_t tensor_id : op.outputs) {
+            if (tensor_id >= graph.consumers_of_tensor.size()) {
+                continue;
+            }
+            std::vector<size_t> experts;
+            std::unordered_set<size_t> expert_set;
+            bool valid = true;
+            for (size_t consumer : graph.consumers_of_tensor[tensor_id]) {
+                if (!IsMatMul(problem.ops[consumer])) {
+                    valid = false;
+                    break;
+                }
+                if (expert_set.insert(consumer).second) {
+                    experts.push_back(consumer);
+                }
+            }
+            if (!valid || experts.size() < kMinExpertBranches) {
+                continue;
+            }
+
+            std::vector<size_t> moe_ops;
+            moe_ops.reserve(experts.size() + 1);
+            moe_ops.push_back(op_id);
+            moe_ops.insert(moe_ops.end(), experts.begin(), experts.end());
+            std::sort(moe_ops.begin(), moe_ops.end(),
+                      [&](size_t lhs, size_t rhs) {
+                          return graph.topo_pos[lhs] < graph.topo_pos[rhs];
+                      });
+            moe_ops.erase(std::unique(moe_ops.begin(), moe_ops.end()), moe_ops.end());
+            if (moe_ops.size() >= 3) {
+                add_pattern(std::move(moe_ops));
+            }
+        }
+    }
+
+    // P2.1: attention-like 6-op blocks.  The current benchmark family encodes
+    // them as contiguous six-op runs in topo order, so we conservatively detect
+    // contiguous 6-op windows that are all MatMul and connected.
+    constexpr size_t kAttentionBlockOps = 6;
+    const size_t n = graph.topo_order.size();
+    for (size_t start = 0; start + kAttentionBlockOps <= n; ++start) {
+        std::vector<size_t> ops;
+        ops.reserve(kAttentionBlockOps);
+        bool all_matmul = true;
+        for (size_t offset = 0; offset < kAttentionBlockOps; ++offset) {
+            size_t op_id = graph.topo_order[start + offset];
+            ops.push_back(op_id);
+            if (!IsMatMul(problem.ops[op_id])) {
+                all_matmul = false;
+                break;
+            }
+        }
+        if (!all_matmul) {
+            continue;
+        }
+        if (!IsConnectedSubDAG(graph, ops)) {
+            continue;
+        }
+        add_pattern(std::move(ops));
+    }
+
+    return patterns;
+}
+
+void AppendPatternCandidates(const Problem& problem, const OpGraph& graph,
+                             const OptimusConfig& config,
+                             bool allow_noncontig_groups,
+                             std::vector<std::vector<CandidateGroup>>* by_start) {
+    if (by_start == nullptr) {
+        return;
+    }
+
+    const auto patterns = DetectSpecialPatternOpSets(problem, graph);
+    for (const auto& ops : patterns) {
+        CandidateGroup candidate = BuildBestCandidate(problem, graph, ops, config);
+        if (!candidate.metrics.valid) {
+            continue;
+        }
+        if (!allow_noncontig_groups &&
+            candidate.ops.size() != candidate.end - candidate.start + 1) {
+            continue;
+        }
+        if (candidate.ops.size() > 1 && candidate.internalized_bytes < 1) {
+            continue;
+        }
+        if (candidate.start >= by_start->size()) {
+            continue;
+        }
+        (*by_start)[candidate.start].push_back(std::move(candidate));
+    }
+
+    for (auto& bucket : *by_start) {
+        DedupCandidateBucket(&bucket);
+    }
 }
 
 std::vector<std::vector<CandidateGroup>> GenerateCandidates(
@@ -2954,6 +3278,76 @@ SearchDecision SolveFromStateWithScheduler(
     return best;
 }
 
+// Generate column-major tile traversal order.
+// In row-major (default), col_tile changes fast (good for LHS reuse across a row).
+// In column-major, row_tile changes fast (good for RHS/weight reuse across a column).
+TraversalOrder GenerateColumnMajorTraversal(int64_t tiles_w, int64_t tiles_h) {
+    TraversalOrder order;
+    order.reserve(static_cast<size_t>(tiles_w * tiles_h));
+    for (int64_t col = 0; col < tiles_w; ++col) {
+        for (int64_t row = 0; row < tiles_h; ++row) {
+            order.push_back(row * tiles_w + col);
+        }
+    }
+    return order;
+}
+
+// Generate Z-order (Morton code) tile traversal for 2D spatial locality.
+// Groups nearby tiles together to improve fast memory reuse for both dimensions.
+TraversalOrder GenerateZOrderTraversal(int64_t tiles_w, int64_t tiles_h) {
+    const int64_t spatial_tiles = tiles_w * tiles_h;
+    std::vector<std::pair<uint64_t, int64_t>> entries;
+    entries.reserve(static_cast<size_t>(spatial_tiles));
+    for (int64_t idx = 0; idx < spatial_tiles; ++idx) {
+        const int64_t row = idx / tiles_w;
+        const int64_t col = idx % tiles_w;
+        uint64_t morton = 0;
+        for (int bit = 0; bit < 16; ++bit) {
+            morton |= ((static_cast<uint64_t>(row) >> bit) & 1ULL) << (2 * bit + 1);
+            morton |= ((static_cast<uint64_t>(col) >> bit) & 1ULL) << (2 * bit);
+        }
+        entries.push_back({morton, idx});
+    }
+    std::sort(entries.begin(), entries.end());
+    TraversalOrder order;
+    order.reserve(static_cast<size_t>(spatial_tiles));
+    for (const auto& [_, idx] : entries) {
+        order.push_back(idx);
+    }
+    return order;
+}
+
+// Try column-major and Z-order traversals; return the one with lowest latency.
+// Returns nullopt if row-major (default/nullopt) is already optimal.
+std::optional<TraversalOrder> BestTraversalOrder(
+    const Problem& problem,
+    const Subgraph& base_subgraph,
+    const std::vector<size_t>& retained_inputs,
+    double base_latency,
+    int64_t tiles_w,
+    int64_t tiles_h) {
+    if (tiles_w * tiles_h <= 1) return std::nullopt;
+
+    std::optional<TraversalOrder> best_order = std::nullopt;
+    double best_latency = base_latency;
+
+    auto try_order = [&](TraversalOrder order) {
+        Subgraph sg = base_subgraph;
+        sg.traversal_order = std::move(order);
+        SubgraphEvaluation eval;
+        if (EvaluateSubgraph(problem, sg, retained_inputs, &eval) && eval.valid &&
+            eval.latency < best_latency) {
+            best_latency = eval.latency;
+            best_order = sg.traversal_order;
+        }
+    };
+
+    try_order(GenerateColumnMajorTraversal(tiles_w, tiles_h));
+    try_order(GenerateZOrderTraversal(tiles_w, tiles_h));
+
+    return best_order;
+}
+
 Solution BuildSolutionFromSchedule(
     const Problem& problem, const std::vector<CandidateGroup>& schedule) {
     Solution solution;
@@ -2984,7 +3378,6 @@ Solution BuildSolutionFromSchedule(
         }
         subgraph.subgraph_latency = scored_metrics.latency;
         solution.subgraphs.push_back(std::move(subgraph));
-
         retained_inputs = solution.subgraphs.back().tensors_to_retain;
     }
 
@@ -3238,6 +3631,39 @@ void AddAnalyticalTileCandidates(const Problem& problem,
                 EstimateProxyLatency(problem, graph, ops, boundary, g);
             if (std::isfinite(proxy_score)) {
                 proxy_ranked->push_back({proxy_score, g});
+            }
+        }
+    }
+
+    // Always add "full-width, max-height" candidates for each k-step.
+    // These are often optimal (tiles_w=1 minimises LHS reload) but can be
+    // missed by the ratio-based loop above if the aspect ratio is unusual.
+    for (int64_t k_step : k_steps) {
+        if (k_step <= 0) {
+            continue;
+        }
+        // Binary search for the largest gran_h at full width that fits.
+        int64_t lo = 1, hi = out_h;
+        while (lo < hi) {
+            const int64_t mid = lo + (hi - lo + 1) / 2;
+            const Granularity test_g{out_w, mid, k_step};
+            if (EstimateWorkingSetBytes(problem, graph, ops, boundary, test_g) <=
+                static_cast<int64_t>(C)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if (lo > 0) {
+            const Granularity g{out_w, lo, k_step};
+            const int64_t ws =
+                EstimateWorkingSetBytes(problem, graph, ops, boundary, g);
+            if (ws <= static_cast<int64_t>(C)) {
+                const double proxy_score =
+                    EstimateProxyLatency(problem, graph, ops, boundary, g);
+                if (std::isfinite(proxy_score)) {
+                    proxy_ranked->push_back({proxy_score, g});
+                }
             }
         }
     }
@@ -4240,7 +4666,19 @@ Solution SolveWithPaperOptimus(const Problem& problem) {
     const OpGraph graph = BuildOpGraph(problem);
     const size_t n = graph.topo_order.size();
 
-    std::cerr << "Optimus paper: N=" << n << "\n";
+    // Bitmask DP threshold: N <= threshold uses uint64_t bitmask (faster ops);
+    // larger N falls through to frontier DP (vector<uint64_t>) or positional DP.
+    // Bounded to [1, 64] because BitmaskDP relies on uint64_t storage.
+    size_t bitmask_threshold = 20;
+    if (const char* env = std::getenv("MLSYS_OPTIMUS_BITMASK_THRESHOLD")) {
+        const long parsed = std::atol(env);
+        if (parsed > 0 && parsed <= 64) {
+            bitmask_threshold = static_cast<size_t>(parsed);
+        }
+    }
+
+    std::cerr << "Optimus paper: N=" << n
+              << " bitmask_threshold=" << bitmask_threshold << "\n";
 
     OptimusConfig config;
     config.candidate_mode = GetCandidateGenerationMode();
@@ -4331,9 +4769,9 @@ Solution SolveWithPaperOptimus(const Problem& problem) {
         candidates = GenerateCandidates(problem, graph, config);
     }
 
-    if (n > 20) {
-        // For N > 20, prefer the frontier set-cover DP when seed-growth is
-        // active (needed to evaluate non-contiguous candidates).  Fall back
+    if (n > bitmask_threshold) {
+        // For N > threshold, prefer the frontier set-cover DP when seed-growth
+        // is active (needed to evaluate non-contiguous candidates). Fall back
         // to the positional DP on memo-cap overflow or empty schedule.
         if (config.candidate_mode == CandidateGenerationMode::kSeedGrowth) {
             std::cerr << "Optimus paper: frontier DP (N=" << n << ")\n";

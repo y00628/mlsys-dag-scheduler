@@ -26,5 +26,6 @@ struct Solution {
 
 // Write a solution to a JSON file.
 void WriteSolution(const Solution& solution, const std::string& filename);
+Solution ReadSolution(const std::string& filename);
 
 }  // namespace mlsys

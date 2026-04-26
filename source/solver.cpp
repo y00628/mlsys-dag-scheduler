@@ -281,7 +281,7 @@ Solution NaiveBaseline(const Problem& problem) {
 SolverBackend ParseSolverBackend() {
     const char* raw = std::getenv("MLSYS_SOLVER");
     if (raw == nullptr) {
-        return SolverBackend::kOptimus;
+        return SolverBackend::kOptimusPaper;
     }
 
     std::string backend(raw);

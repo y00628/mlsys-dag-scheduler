@@ -48,4 +48,35 @@ void WriteSolution(const Solution& solution, const std::string& filename) {
     ofs << j.dump(2) << std::endl;
 }
 
+Solution ReadSolution(const std::string& filename) {
+    std::ifstream ifs(filename);
+    if (!ifs.is_open()) {
+        throw std::runtime_error("Cannot open solution file: " + filename);
+    }
+    json j;
+    ifs >> j;
+
+    Solution sol;
+    const auto& subgraphs = j["subgraphs"];
+    const auto& retains   = j["tensors_to_retain"];
+    const auto& grans     = j["granularities"];
+    const auto& travs     = j["traversal_orders"];
+    const auto& lats      = j["subgraph_latencies"];
+    for (size_t i = 0; i < subgraphs.size(); ++i) {
+        Subgraph sg;
+        sg.op_ids = subgraphs[i].get<std::vector<size_t>>();
+        sg.tensors_to_retain = retains[i].get<std::vector<size_t>>();
+        const auto& g = grans[i];
+        sg.granularity.width  = g[0].get<int64_t>();
+        sg.granularity.height = g[1].get<int64_t>();
+        sg.granularity.depth  = g[2].get<int64_t>();
+        if (!travs[i].is_null()) {
+            sg.traversal_order = travs[i].get<std::vector<int64_t>>();
+        }
+        sg.subgraph_latency = lats[i].get<double>();
+        sol.subgraphs.push_back(std::move(sg));
+    }
+    return sol;
+}
+
 }  // namespace mlsys
