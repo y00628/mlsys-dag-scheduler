@@ -106,7 +106,7 @@ MLSYS_SOLVER=optimus_paper MLSYS_OPTIMUS_CANDIDATES=seed ./build/mlsys benchmark
 
 | Benchmark | N ops | Baseline | Current Best | Improvement | Cycles Saved |
 |---|---:|---:|---:|---:|---:|
-| mlsys-2026-1 | 5 | 471,500.80 | **405,875** | **-13.92%** | 65,626 |
+| mlsys-2026-1 | 5 | 471,500.80 | **400,000** | **-15.18%** | 71,501 |
 | mlsys-2026-5 | 19 | 1,013,623.47 | **650,528** | **-35.82%** | 363,095 |
 | mlsys-2026-9 | 32 | 167,530,987.52 | **164,506,000** | **-1.81%** | 3,024,988 |
 | mlsys-2026-13 | 63 | 166,414,742.80 | **166,403,000** | **-0.01%** | 11,743 |
@@ -121,3 +121,4 @@ MLSYS_SOLVER=optimus_paper MLSYS_OPTIMUS_CANDIDATES=seed ./build/mlsys benchmark
 | Graph-cut decomposition | `optimus.cpp` | Splits large DAGs into independent segments; dramatically reduces wall time for BM-9/13/17 |
 | Frontier DP | `optimus.cpp` | Handles segments with N>20 ops that exceed bitmask DP limit |
 | Pre-op fusion (opt-in) | `optimus.cpp` | `MLSYS_ENABLE_PREOP_FUSION=1` allows [Pointwise, MatMul] pattern (disabled by default) |
+| `EstimateMaxGroupSize` small-DAG unlock | `optimus.cpp` | N≤8 DAGs now try all-ops-in-one-group; enables BM-1 5-op chain fusion saving 5,875 cycles |

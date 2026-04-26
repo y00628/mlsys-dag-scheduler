@@ -2244,16 +2244,26 @@ size_t EstimateMaxGroupSize(const Problem& problem) {
         return 4;
     }
     const int64_t ratio = problem.fast_memory_capacity / native_tile;
+    size_t cap;
     if (ratio <= 2) {
-        return 2;
+        cap = 2;
+    } else if (ratio <= 4) {
+        cap = 4;
+    } else if (ratio <= 8) {
+        cap = 6;
+    } else {
+        cap = kDefaultMaxGroupSize;
     }
-    if (ratio <= 4) {
-        return 4;
+    // For small DAGs, always allow trying the entire graph as a single fused
+    // group. The ratio-based cap was designed for large DAGs where trying
+    // every op together would be wasteful; for N ≤ 8 the search space is
+    // small enough and some problems (e.g. BM-1) have a chain-structured
+    // graph where the all-ops fusion saves inter-subgraph write traffic.
+    const size_t n_ops = problem.ops.size();
+    if (n_ops <= 8) {
+        cap = std::max(cap, n_ops);
     }
-    if (ratio <= 8) {
-        return 6;
-    }
-    return kDefaultMaxGroupSize;
+    return cap;
 }
 
 void DedupCandidateBucket(std::vector<CandidateGroup>* bucket) {
