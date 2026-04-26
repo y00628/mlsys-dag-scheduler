@@ -4,16 +4,19 @@
 #include "evaluator.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -122,6 +125,9 @@ struct StepEstimate {
     int64_t active_bytes = 0;
     int64_t output_write_bytes = 0;
     double compute_cost = 0.0;
+    // Subset of active_bytes that are non-coalesced (e.g. MatMul RHS column-stride
+    // access). Used by the proxy to apply a bandwidth penalty multiplier.
+    int64_t noncoalesced_bytes = 0;
 };
 
 // Scheduler-driven analysis result stored per candidate.
@@ -287,7 +293,11 @@ struct LegalityPolicyConfig {
     bool enforce_internalized_multi_op = true;
 };
 
-std::unordered_map<ScoreCacheKey, GroupMetrics, ScoreCacheKeyHash> g_score_cache;
+// Thread-local score cache: each worker thread gets its own cache so no
+// locking is needed. Hits within a thread are still fast; cross-thread
+// sharing is sacrificed for simplicity and safety.
+thread_local std::unordered_map<ScoreCacheKey, GroupMetrics, ScoreCacheKeyHash>
+    g_score_cache;
 
 int64_t CeilDivInt(int64_t value, int64_t divisor) {
     if (divisor <= 0) {
@@ -320,6 +330,47 @@ int64_t ReadInt64EnvOrDefault(const char* name, int64_t default_value) {
         return default_value;
     }
     return static_cast<int64_t>(parsed);
+}
+
+double ReadDoubleEnvOrDefault(const char* name, double default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    char* end = nullptr;
+    const double parsed = std::strtod(raw, &end);
+    if (end == raw) {
+        return default_value;
+    }
+    return parsed;
+}
+
+// Number of threads for parallel candidate generation.
+// MLSYS_NUM_THREADS=N overrides; default = hardware_concurrency (capped at 16).
+size_t ReadNumThreads() {
+    static const size_t kThreads = []() -> size_t {
+        const char* raw = std::getenv("MLSYS_NUM_THREADS");
+        if (raw != nullptr) {
+            char* end = nullptr;
+            const long v = std::strtol(raw, &end, 10);
+            if (end != raw && v > 0) {
+                return static_cast<size_t>(v);
+            }
+        }
+        const unsigned hw = std::thread::hardware_concurrency();
+        return std::min<size_t>(hw > 0 ? hw : 4, 16);
+    }();
+    return kThreads;
+}
+
+// Returns the bandwidth penalty multiplier for non-coalesced memory accesses
+// (e.g. MatMul RHS column-stride reads). Effective bandwidth for non-coalesced
+// accesses is divided by this factor. Default 1.0 (disabled).
+// Set MLSYS_COALESCE_PENALTY=2.0 to model 2x bandwidth penalty for RHS.
+double GetCoalescePenalty() {
+    static const double kPenalty =
+        ReadDoubleEnvOrDefault("MLSYS_COALESCE_PENALTY", 1.0);
+    return kPenalty;
 }
 
 int64_t MatMulK(const Problem& problem, size_t op_id) {
@@ -874,6 +925,7 @@ ReuseAwareEstimate EstimateSchedulerLatency(
         CeilDivInt(granularity.height, native_h));
     const double bw =
         std::max<double>(1.0, static_cast<double>(problem.slow_memory_bandwidth));
+    const double coalesce_penalty = GetCoalescePenalty();
 
     double total_latency = 0.0;
     double total_traffic = 0.0;
@@ -883,7 +935,8 @@ ReuseAwareEstimate EstimateSchedulerLatency(
         const int64_t k_begin = step_index * granularity.depth;
 
         double compute_cost = 0.0;
-        double memory_bytes = 0.0;
+        double coalesced_bytes = 0.0;
+        double noncoalesced_bytes = 0.0;
 
         for (size_t op_id : ops) {
             const auto& op = problem.ops[op_id];
@@ -903,28 +956,30 @@ ReuseAwareEstimate EstimateSchedulerLatency(
 
                 // LHS (activation): h × k_step, reused across column tiles.
                 // Amortized: load once per row of tiles → divide by tiles_w.
+                // Row-major access → coalesced.
                 if (!op.inputs.empty()) {
                     int p = graph.producer_of_tensor[op.inputs[0]];
                     if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
-                        memory_bytes += static_cast<double>(
-                                            actual_h * actual_k_step) /
-                                        static_cast<double>(tiles_w);
+                        coalesced_bytes += static_cast<double>(
+                                               actual_h * actual_k_step) /
+                                           static_cast<double>(tiles_w);
                     }
                 }
                 // RHS (weight): w × k_step, reused across row tiles.
                 // Amortized: load once per column of tiles → divide by tiles_h.
+                // Column-stride access → non-coalesced.
                 if (op.inputs.size() >= 2) {
                     int p = graph.producer_of_tensor[op.inputs[1]];
                     if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
-                        memory_bytes += static_cast<double>(
-                                            actual_w * actual_k_step) /
-                                        static_cast<double>(tiles_h);
+                        noncoalesced_bytes += static_cast<double>(
+                                                 actual_w * actual_k_step) /
+                                             static_cast<double>(tiles_h);
                     }
                 }
                 // Output: stays in fast memory across k-steps, written once.
                 if (final_k_step &&
                     boundary_outputs.count(op.outputs.front())) {
-                    memory_bytes += actual_h * actual_w;
+                    coalesced_bytes += actual_h * actual_w;
                 }
             } else if (IsPointwise(op) && final_k_step) {
                 compute_cost +=
@@ -934,19 +989,21 @@ ReuseAwareEstimate EstimateSchedulerLatency(
                 for (size_t tensor_id : op.inputs) {
                     int p = graph.producer_of_tensor[tensor_id];
                     if (p < 0 || !op_set.count(static_cast<size_t>(p))) {
-                        memory_bytes += actual_h * actual_w;
+                        coalesced_bytes += actual_h * actual_w;
                     }
                 }
                 // Output.
                 if (boundary_outputs.count(op.outputs.front())) {
-                    memory_bytes += actual_h * actual_w;
+                    coalesced_bytes += actual_h * actual_w;
                 }
             }
         }
 
-        const double memory_time = memory_bytes / bw;
+        const double memory_time =
+            coalesced_bytes / bw +
+            noncoalesced_bytes / (bw / coalesce_penalty);
         total_latency += std::max(compute_cost, memory_time);
-        total_traffic += memory_bytes;
+        total_traffic += coalesced_bytes + noncoalesced_bytes;
     }
 
     result.latency =
@@ -1342,6 +1399,13 @@ void AddAnalyticalTileCandidates(const Problem& problem,
                                   const std::vector<int64_t>& k_steps,
                                   std::vector<std::pair<double, Granularity>>* proxy_ranked);
 
+void AddMemoryBoundTileCandidates(const Problem& problem,
+                                   const OpGraph& graph,
+                                   const std::vector<size_t>& ops,
+                                   const GroupBoundary& boundary,
+                                   const std::vector<int64_t>& k_steps,
+                                   std::vector<std::pair<double, Granularity>>* proxy_ranked);
+
 StepEstimate EstimateStep(const Problem& problem, const OpGraph& graph,
                           const std::vector<size_t>& ops,
                           const GroupBoundary& boundary,
@@ -1403,9 +1467,13 @@ StepEstimate EstimateStep(const Problem& problem, const OpGraph& graph,
                 continue;
             }
             if (input_index == 0) {
+                // LHS: row-major row slice — coalesced access.
                 step.active_bytes += actual_h * k_step;
             } else {
-                step.active_bytes += actual_w * k_step;
+                // RHS: column slice fetched with non-unit stride — non-coalesced.
+                const int64_t rhs_bytes = actual_w * k_step;
+                step.active_bytes += rhs_bytes;
+                step.noncoalesced_bytes += rhs_bytes;
             }
         }
         if (boundary_outputs.count(op.outputs.front())) {
@@ -1503,16 +1571,24 @@ double EstimateProxyLatency(const Problem& problem, const OpGraph& graph,
 
     // Compute total latency for one tile with given actual dimensions (ah × aw).
     // Sums roofline cost max(compute, memory) across all k-steps.
+    // Non-coalesced bytes (MatMul RHS) are penalized with a reduced effective
+    // bandwidth controlled by MLSYS_COALESCE_PENALTY (default 1.0 = no penalty).
+    const double bw =
+        std::max<double>(1.0, static_cast<double>(problem.slow_memory_bandwidth));
+    const double coalesce_penalty = GetCoalescePenalty();
     auto compute_tile_latency = [&](int64_t ah, int64_t aw) -> double {
         double lat = 0.0;
         for (int64_t step = 0; step < max_k_steps; ++step) {
             const StepEstimate est = EstimateStep(
                 problem, graph, ops, boundary, granularity, ah, aw,
                 step, max_k_steps);
+            const int64_t coalesced_bytes =
+                (est.active_bytes - est.noncoalesced_bytes) +
+                est.output_write_bytes;
             const double mem =
-                (static_cast<double>(est.active_bytes) +
-                 static_cast<double>(est.output_write_bytes)) /
-                static_cast<double>(problem.slow_memory_bandwidth);
+                static_cast<double>(coalesced_bytes) / bw +
+                static_cast<double>(est.noncoalesced_bytes) /
+                    (bw / coalesce_penalty);
             lat += std::max(est.compute_cost, mem);
         }
         return lat;
@@ -1877,6 +1953,9 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
         AddAnalyticalTileCandidates(problem, graph, candidate.ops,
                                      candidate.boundary, k_steps_to_try,
                                      &proxy_ranked);
+        AddMemoryBoundTileCandidates(problem, graph, candidate.ops,
+                                      candidate.boundary, k_steps_to_try,
+                                      &proxy_ranked);
     }
 
     std::sort(proxy_ranked.begin(), proxy_ranked.end(),
@@ -2086,6 +2165,9 @@ CandidateGroup BuildBestCandidateWithScheduler(
         AddAnalyticalTileCandidates(problem, graph, candidate.ops,
                                      candidate.boundary, k_steps_to_try,
                                      &proxy_ranked);
+        AddMemoryBoundTileCandidates(problem, graph, candidate.ops,
+                                      candidate.boundary, k_steps_to_try,
+                                      &proxy_ranked);
     }
 
     // --- Sort and optionally apply V2 reranking ------------------------------
@@ -2170,6 +2252,52 @@ size_t EstimateMaxGroupSize(const Problem& problem) {
     return kDefaultMaxGroupSize;
 }
 
+// Process one start position for the interval candidate generator.
+// Returns (by_start_entry, rejected_count, reject_reasons).
+static void ProcessIntervalStart(
+    const Problem& problem, const OpGraph& graph, const OptimusConfig& config,
+    size_t start, size_t max_group_size, size_t n,
+    std::vector<CandidateGroup>* out_candidates,
+    size_t* out_rejected,
+    std::vector<size_t>* out_reject_reasons) {
+    constexpr size_t kReasonCount =
+        static_cast<size_t>(LegalityReason::kRuntimeBudgetExceeded) + 1;
+    out_reject_reasons->assign(kReasonCount, 0);
+    *out_rejected = 0;
+
+    for (size_t end = start; end < n && end < start + max_group_size; ++end) {
+        CandidateGroup candidate =
+            BuildBestCandidate(problem, graph, start, end, config);
+        if (!candidate.metrics.valid) {
+            ++(*out_rejected);
+            ++(*out_reject_reasons)[static_cast<size_t>(candidate.legality.reason)];
+            continue;
+        }
+        if (candidate.ops.size() > 1) {
+            constexpr int64_t min_gain = 1;
+            if (candidate.internalized_bytes < min_gain) {
+                candidate.legality.is_valid = false;
+                candidate.legality.level_passed = LegalityLevel::kL1Execution;
+                candidate.legality.failed_level = LegalityLevel::kL3Policy;
+                candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
+                candidate.legality.debug_note = "interval_min_internalized";
+                ++(*out_rejected);
+                ++(*out_reject_reasons)[static_cast<size_t>(candidate.legality.reason)];
+                continue;
+            }
+        }
+        out_candidates->push_back(std::move(candidate));
+    }
+
+    if (out_candidates->empty()) {
+        CandidateGroup fallback =
+            BuildBestCandidate(problem, graph, start, start, config);
+        if (fallback.metrics.valid) {
+            out_candidates->push_back(std::move(fallback));
+        }
+    }
+}
+
 std::vector<std::vector<CandidateGroup>> GenerateCandidates(
     const Problem& problem, const OpGraph& graph, const OptimusConfig& config) {
     constexpr size_t kReasonCount =
@@ -2181,69 +2309,46 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
     std::vector<std::vector<size_t>> reject_reasons_by_start(
         n, std::vector<size_t>(kReasonCount, 0));
 
-    for (size_t start = 0; start < n; ++start) {
-        for (size_t end = start;
-             end < n && end < start + max_group_size; ++end) {
-            CandidateGroup candidate =
-                BuildBestCandidate(problem, graph, start, end, config);
-            if (!candidate.metrics.valid) {
-                ++rejected_candidates_by_start[start];
-                ++reject_reasons_by_start[start][
-                    static_cast<size_t>(candidate.legality.reason)];
-                if (LegalityDebugEnabled()) {
-                    std::cerr << "  legality_reject(interval) start=" << start
-                              << " level=" << ToString(candidate.legality.failed_level)
-                              << " reason=" << ToString(candidate.legality.reason)
-                              << " note=" << candidate.legality.debug_note << "\n";
-                }
-                continue;
-            }
-
-            if (candidate.ops.size() > 1) {
-                // Require at least 1 internalized element for multi-op
-                // candidates.  The old threshold (native_w * native_h) was
-                // far too conservative and rejected most fusion groups.
-                constexpr int64_t min_gain = 1;
-                if (candidate.internalized_bytes < min_gain) {
-                    candidate.legality.is_valid = false;
-                    candidate.legality.level_passed = LegalityLevel::kL1Execution;
-                    candidate.legality.failed_level = LegalityLevel::kL3Policy;
-                    candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
-                    candidate.legality.debug_note = "interval_min_internalized";
-                    ++rejected_candidates_by_start[start];
-                    ++reject_reasons_by_start[start][
-                        static_cast<size_t>(candidate.legality.reason)];
-                    if (LegalityDebugEnabled()) {
-                        std::cerr << "  legality_reject(interval) start=" << start
-                                  << " level=" << ToString(candidate.legality.failed_level)
-                                  << " reason=" << ToString(candidate.legality.reason)
-                                  << " note=" << candidate.legality.debug_note << "\n";
-                    }
-                    continue;
-                }
-            }
-
-            by_start[start].push_back(std::move(candidate));
+    const size_t num_threads = (n >= 4) ? ReadNumThreads() : 1;
+    if (num_threads <= 1) {
+        for (size_t start = 0; start < n; ++start) {
+            ProcessIntervalStart(problem, graph, config, start, max_group_size, n,
+                                 &by_start[start],
+                                 &rejected_candidates_by_start[start],
+                                 &reject_reasons_by_start[start]);
         }
-
-        if (by_start[start].empty()) {
-            CandidateGroup fallback =
-                BuildBestCandidate(problem, graph, start, start, config);
-            if (fallback.metrics.valid) {
-                by_start[start].push_back(std::move(fallback));
-            }
+    } else {
+        // Distribute start indices across threads. Each thread writes into
+        // its own slice of by_start (no shared writes — start indices are
+        // disjoint across threads).
+        std::atomic<size_t> next_start{0};
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+        for (size_t t = 0; t < num_threads; ++t) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    const size_t start = next_start.fetch_add(1, std::memory_order_relaxed);
+                    if (start >= n) break;
+                    ProcessIntervalStart(problem, graph, config, start,
+                                         max_group_size, n,
+                                         &by_start[start],
+                                         &rejected_candidates_by_start[start],
+                                         &reject_reasons_by_start[start]);
+                }
+            });
         }
+        for (auto& w : workers) w.join();
+    }
 
-        if (SeedDebugEnabled() || LegalityDebugEnabled()) {
+    if (SeedDebugEnabled() || LegalityDebugEnabled()) {
+        for (size_t start = 0; start < n; ++start) {
             std::cerr << "interval start " << start
                       << " candidates=" << by_start[start].size()
                       << " rejected=" << rejected_candidates_by_start[start] << "\n";
             std::vector<std::pair<size_t, size_t>> reason_counts;
             for (size_t i = 0; i < reject_reasons_by_start[start].size(); ++i) {
                 const size_t count = reject_reasons_by_start[start][i];
-                if (count > 0) {
-                    reason_counts.push_back({count, i});
-                }
+                if (count > 0) reason_counts.push_back({count, i});
             }
             std::sort(reason_counts.begin(), reason_counts.end(),
                       [](const auto& lhs, const auto& rhs) {
@@ -2253,7 +2358,8 @@ std::vector<std::vector<CandidateGroup>> GenerateCandidates(
                 std::cerr << "  reject_reasons:";
                 const size_t top_k = std::min<size_t>(3, reason_counts.size());
                 for (size_t i = 0; i < top_k; ++i) {
-                    const auto reason = static_cast<LegalityReason>(reason_counts[i].second);
+                    const auto reason =
+                        static_cast<LegalityReason>(reason_counts[i].second);
                     std::cerr << " " << ToString(reason) << "=" << reason_counts[i].first;
                 }
                 std::cerr << "\n";
@@ -2393,11 +2499,6 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
         static_cast<size_t>(LegalityReason::kRuntimeBudgetExceeded) + 1;
     const size_t n = graph.topo_order.size();
     SeedGrowthRuntimeConfig runtime = GetSeedGrowthRuntimeConfig();
-    // The bitmask/frontier DP handles non-contiguous groups correctly, so the
-    // contiguous-span filter must be disabled when the caller opts in via
-    // config.allow_noncontig_groups. Without this override, every
-    // non-contiguous candidate is rejected at L3 (note=contiguous_required)
-    // before the set-cover DP ever sees it.
     if (config.allow_noncontig_groups) {
         runtime.require_contiguous_topo = false;
     }
@@ -2416,180 +2517,261 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
     std::vector<size_t> rejected_candidates_by_start(n, 0);
     std::vector<std::vector<size_t>> reject_reasons_by_start(
         n, std::vector<size_t>(kReasonCount, 0));
-    std::unordered_map<std::vector<size_t>, CandidateGroup, OpVectorHash> candidate_cache;
-    candidate_cache.reserve(std::max<size_t>(1024, runtime.total_queue_budget / 2));
-    size_t global_queue_pushes = 0;
 
-    // Pre-generate singleton candidates for ALL topo positions.
-    // This guarantees full coverage: even if seed-growth doesn't produce
-    // any candidate starting at a given position, the DP can always fall
-    // back to the singleton.
-    for (size_t pos = 0; pos < n; ++pos) {
-        CandidateGroup singleton =
-            BuildBestCandidate(problem, graph, {graph.topo_order[pos]}, config);
-        if (singleton.metrics.valid) {
-            by_start[pos].push_back(std::move(singleton));
+    // Global queue-push budget shared across all seeds (atomic for MT safety).
+    std::atomic<size_t> global_queue_pushes{0};
+
+    const size_t num_threads = (n >= 4) ? ReadNumThreads() : 1;
+
+    // -------------------------------------------------------------------------
+    // Phase 1: pre-generate singleton candidates (one per topo position).
+    // Each position is independent — trivially parallelisable.
+    // -------------------------------------------------------------------------
+    {
+        std::atomic<size_t> next_pos{0};
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+        for (size_t t = 0; t < num_threads; ++t) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    const size_t pos = next_pos.fetch_add(1, std::memory_order_relaxed);
+                    if (pos >= n) break;
+                    CandidateGroup singleton = BuildBestCandidate(
+                        problem, graph, {graph.topo_order[pos]}, config);
+                    if (singleton.metrics.valid) {
+                        by_start[pos].push_back(std::move(singleton));
+                    }
+                }
+            });
         }
+        for (auto& w : workers) w.join();
     }
 
-    for (size_t topo_idx = 0; topo_idx < n; ++topo_idx) {
-        const size_t seed = graph.topo_order[topo_idx];
-        std::queue<std::vector<size_t>> pending;
-        std::unordered_set<std::vector<size_t>, OpVectorHash> seen;
-        size_t explored_states = 0;
-        size_t accepted_candidates = 0;
-        size_t rejected_candidates = 0;
-        double best_latency = std::numeric_limits<double>::max();
-        size_t iterations_without_improvement = 0;
-        constexpr size_t kMaxIterationsWithoutImprovement = 20;  // More aggressive early termination
+    // -------------------------------------------------------------------------
+    // Phase 2: BFS seed-growth per topo position.
+    // Each seed's BFS is independent of other seeds. Writes go to by_start[]
+    // entries (each thread owns disjoint entries in the non-contig case OR
+    // we serialize writes via a mutex when allow_noncontig_groups is false
+    // and candidates may land at arbitrary by_start[candidate.start]).
+    // For simplicity and correctness we use a per-slot mutex.
+    // -------------------------------------------------------------------------
+    std::vector<std::mutex> slot_mutex(n);
 
-        const std::vector<size_t> seed_ops = CandidateKeyFromOps(
-            CanonicalizeOpSet({seed}, graph));
-        pending.push(seed_ops);
-        ++global_queue_pushes;
-        seen.insert(seed_ops);
+    {
+        std::atomic<size_t> next_seed{0};
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
+        for (size_t t = 0; t < num_threads; ++t) {
+            workers.emplace_back([&]() {
+                // Per-thread candidate cache: avoids repeated BuildBestCandidate
+                // calls for the same op-set within this thread's seeds.
+                std::unordered_map<std::vector<size_t>, CandidateGroup, OpVectorHash>
+                    candidate_cache;
+                candidate_cache.reserve(
+                    std::max<size_t>(256, runtime.total_queue_budget /
+                                             (2 * num_threads)));
 
-        while (!pending.empty()) {
-            std::vector<size_t> current_ops = pending.front();
-            pending.pop();
-            ++explored_states;
+                while (true) {
+                    const size_t topo_idx =
+                        next_seed.fetch_add(1, std::memory_order_relaxed);
+                    if (topo_idx >= n) break;
 
-            if (explored_states > max_states_per_seed) {
-                ++rejected_candidates;
-                ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
-                    LegalityReason::kRuntimeBudgetExceeded)];
-                if (LegalityDebugEnabled()) {
-                    std::cerr << "  legality_reject start=" << topo_idx
-                              << " level=" << ToString(LegalityLevel::kL3Policy)
-                              << " reason=" << ToString(LegalityReason::kRuntimeBudgetExceeded)
-                              << " note=seed_state_budget_exceeded\n";
-                }
-                break;
-            }
+                    const size_t seed = graph.topo_order[topo_idx];
+                    std::unordered_set<std::vector<size_t>, OpVectorHash> seen;
+                    size_t explored_states = 0;
+                    size_t accepted_candidates = 0;
+                    size_t rejected_candidates = 0;
+                    std::vector<size_t> local_reject_reasons(kReasonCount, 0);
+                    double best_latency = std::numeric_limits<double>::max();
+                    size_t depth_without_improvement = 0;
+                    constexpr size_t kMaxDepthsWithoutImprovement = 3;
 
-            // Early termination: if no improvement for many iterations, skip this seed
-            // (likely exhausted high-quality expansion directions)
-            if (iterations_without_improvement > kMaxIterationsWithoutImprovement) {
-                if (LegalityDebugEnabled()) {
-                    std::cerr << "  seed_growth early_termination start=" << topo_idx
-                              << " iterations_no_progress=" << iterations_without_improvement << "\n";
-                }
-                break;
-            }
+                    const std::vector<size_t> seed_ops = CandidateKeyFromOps(
+                        CanonicalizeOpSet({seed}, graph));
+                    seen.insert(seed_ops);
+                    global_queue_pushes.fetch_add(1, std::memory_order_relaxed);
 
-            CandidateGroup candidate;
-            const auto cached = candidate_cache.find(current_ops);
-            if (cached != candidate_cache.end()) {
-                candidate = cached->second;
-            } else {
-                candidate = BuildBestCandidate(problem, graph, current_ops, config);
-                candidate_cache.emplace(current_ops, candidate);
-            }
+                    // Beam: op-sets at the current depth, each paired with its
+                    // fast proxy score (lower = better).
+                    std::vector<std::vector<size_t>> beam = {seed_ops};
 
-            // Track progress: update iteration counter and best latency
-            if (candidate.metrics.valid) {
-                if (candidate.metrics.latency < best_latency) {
-                    best_latency = candidate.metrics.latency;
-                    iterations_without_improvement = 0;  // Reset counter
-                } else {
-                    ++iterations_without_improvement;
-                }
-            } else {
-                ++iterations_without_improvement;
-            }
+                    // Helper: accept/reject a fully-evaluated CandidateGroup
+                    // and update accounting.
+                    auto accept_or_reject = [&](CandidateGroup& cg) {
+                        if (!cg.metrics.valid) {
+                            ++rejected_candidates;
+                            ++local_reject_reasons[static_cast<size_t>(
+                                cg.legality.reason)];
+                            return;
+                        }
+                        if (runtime.require_contiguous_topo &&
+                            !IsContiguousTopoSpan(graph, cg)) {
+                            cg.legality.is_valid = false;
+                            cg.legality.failed_level = LegalityLevel::kL3Policy;
+                            cg.legality.reason =
+                                LegalityReason::kHeuristicRejectPolicy;
+                            cg.legality.debug_note = "contiguous_required";
+                            ++rejected_candidates;
+                            ++local_reject_reasons[static_cast<size_t>(
+                                cg.legality.reason)];
+                            return;
+                        }
+                        if (!PassSeedPolicyFilter(cg, problem)) {
+                            cg.legality.is_valid = false;
+                            cg.legality.failed_level = LegalityLevel::kL3Policy;
+                            cg.legality.reason =
+                                LegalityReason::kHeuristicRejectPolicy;
+                            cg.legality.debug_note = "seed_policy_filter";
+                            ++rejected_candidates;
+                            ++local_reject_reasons[static_cast<size_t>(
+                                cg.legality.reason)];
+                            return;
+                        }
+                        const bool is_contiguous =
+                            (static_cast<size_t>(cg.end - cg.start + 1) ==
+                             cg.ops.size());
+                        if (config.allow_noncontig_groups) {
+                            std::lock_guard<std::mutex> lk(slot_mutex[topo_idx]);
+                            by_start[topo_idx].push_back(cg);
+                        } else if (is_contiguous) {
+                            std::lock_guard<std::mutex> lk(
+                                slot_mutex[cg.start]);
+                            by_start[cg.start].push_back(cg);
+                        }
+                        ++accepted_candidates;
+                    };
 
-            if (candidate.metrics.valid) {
-                if (runtime.require_contiguous_topo &&
-                    !IsContiguousTopoSpan(graph, candidate)) {
-                    candidate.legality.is_valid = false;
-                    candidate.legality.level_passed = LegalityLevel::kL1Execution;
-                    candidate.legality.failed_level = LegalityLevel::kL3Policy;
-                    candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
-                    candidate.legality.debug_note = "contiguous_required";
-                    ++rejected_candidates;
-                    ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
-                        candidate.legality.reason)];
-                    if (LegalityDebugEnabled()) {
-                        std::cerr << "  legality_reject start=" << topo_idx
-                                  << " level=" << ToString(candidate.legality.failed_level)
-                                  << " reason=" << ToString(candidate.legality.reason)
-                                  << " note=" << candidate.legality.debug_note << "\n";
+                    // Evaluate the seed itself.
+                    {
+                        CandidateGroup cg;
+                        const auto it = candidate_cache.find(seed_ops);
+                        if (it != candidate_cache.end()) {
+                            cg = it->second;
+                        } else {
+                            cg = BuildBestCandidate(problem, graph, seed_ops, config);
+                            candidate_cache.emplace(seed_ops, cg);
+                        }
+                        if (cg.metrics.valid && cg.metrics.latency < best_latency) {
+                            best_latency = cg.metrics.latency;
+                        }
+                        accept_or_reject(cg);
+                        ++explored_states;
                     }
-                    continue;
-                }
-                if (PassSeedPolicyFilter(candidate, problem)) {
-                    // When allow_noncontig_groups is set, keep every accepted
-                    // candidate (contiguous or not) and file it under the
-                    // seed's topo-position so the set-cover DP can pick it up
-                    // at the canonical smallest-topo-position. Otherwise only
-                    // keep contiguous candidates because the position-indexed
-                    // DP assumes next_start = candidate.end + 1 and would
-                    // skip uncovered ops between start and end.
-                    const bool is_contiguous =
-                        (static_cast<size_t>(candidate.end - candidate.start + 1) ==
-                         candidate.ops.size());
-                    if (config.allow_noncontig_groups) {
-                        // File under seed's topo-index; the DP rebuilds the
-                        // canonical v0_topo_idx from ops, not from this key.
-                        by_start[topo_idx].push_back(candidate);
-                    } else if (is_contiguous) {
-                        by_start[candidate.start].push_back(candidate);
+
+                    // Depth-iterative beam expansion.
+                    while (!beam.empty() &&
+                           beam.front().size() < max_group_size &&
+                           explored_states <= max_states_per_seed &&
+                           depth_without_improvement < kMaxDepthsWithoutImprovement) {
+
+                        if (global_queue_pushes.load(std::memory_order_relaxed) >=
+                            runtime.total_queue_budget) {
+                            break;
+                        }
+
+                        // Collect all unique grown sets from the current beam.
+                        // Score each cheaply with proxy at native granularity.
+                        std::vector<std::pair<double, std::vector<size_t>>>
+                            next_scored;
+                        for (const auto& cur_ops : beam) {
+                            if (cur_ops.size() >= max_group_size) continue;
+                            const std::vector<size_t> frontier =
+                                CollectGrowthFrontier(
+                                    graph, cur_ops,
+                                    runtime.allow_predecessor_growth,
+                                    runtime.allow_successor_growth,
+                                    runtime.max_frontier);
+                            for (size_t next_op : frontier) {
+                                std::vector<size_t> grown = cur_ops;
+                                grown.push_back(next_op);
+                                const std::vector<size_t> canonical =
+                                    CandidateKeyFromOps(
+                                        CanonicalizeOpSet(grown, graph));
+                                if (!seen.insert(canonical).second) continue;
+                                global_queue_pushes.fetch_add(
+                                    1, std::memory_order_relaxed);
+
+                                // Fast proxy score at native granularity —
+                                // no BuildBestCandidate, no evaluator call.
+                                const GroupBoundary bnd =
+                                    ComputeBoundary(problem, graph, canonical);
+                                const Granularity native_g{
+                                    problem.native_granularity.width,
+                                    problem.native_granularity.height,
+                                    problem.native_granularity.depth};
+                                const double proxy = EstimateProxyLatency(
+                                    problem, graph, canonical, bnd, native_g);
+                                next_scored.push_back({proxy, canonical});
+                            }
+                        }
+
+                        if (next_scored.empty()) break;
+
+                        // Keep top-B by proxy score (lower = better).
+                        // beam_width=0 means no filtering (keep all).
+                        static const size_t beam_width = ReadSizeTEnvOrDefault(
+                            "MLSYS_OPTIMUS_BEAM_WIDTH", 8);
+                        if (beam_width > 0 && next_scored.size() > beam_width) {
+                            std::partial_sort(
+                                next_scored.begin(),
+                                next_scored.begin() +
+                                    static_cast<ptrdiff_t>(beam_width),
+                                next_scored.end(),
+                                [](const auto& a, const auto& b) {
+                                    return a.first < b.first;
+                                });
+                            next_scored.resize(beam_width);
+                        }
+
+                        // Evaluate survivors with BuildBestCandidate.
+                        beam.clear();
+                        double depth_best = std::numeric_limits<double>::max();
+                        for (auto& [proxy_score, ops] : next_scored) {
+                            (void)proxy_score;
+                            ++explored_states;
+                            if (explored_states > max_states_per_seed) break;
+
+                            CandidateGroup cg;
+                            const auto it = candidate_cache.find(ops);
+                            if (it != candidate_cache.end()) {
+                                cg = it->second;
+                            } else {
+                                cg = BuildBestCandidate(
+                                    problem, graph, ops, config);
+                                candidate_cache.emplace(ops, cg);
+                            }
+                            if (cg.metrics.valid &&
+                                cg.metrics.latency < depth_best) {
+                                depth_best = cg.metrics.latency;
+                            }
+                            accept_or_reject(cg);
+                            // Advance from this op-set next depth regardless
+                            // of validity — it may expand to valid groups.
+                            beam.push_back(ops);
+                        }
+
+                        if (depth_best < best_latency) {
+                            best_latency = depth_best;
+                            depth_without_improvement = 0;
+                        } else {
+                            ++depth_without_improvement;
+                        }
                     }
-                    ++accepted_candidates;
-                } else {
-                    candidate.legality.is_valid = false;
-                    candidate.legality.level_passed = LegalityLevel::kL1Execution;
-                    candidate.legality.failed_level = LegalityLevel::kL3Policy;
-                    candidate.legality.reason = LegalityReason::kHeuristicRejectPolicy;
-                    candidate.legality.debug_note = "seed_policy_filter";
-                    ++rejected_candidates;
-                    ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
-                        candidate.legality.reason)];
-                    if (LegalityDebugEnabled()) {
-                        std::cerr << "  legality_reject start=" << topo_idx
-                                  << " level=" << ToString(candidate.legality.failed_level)
-                                  << " reason=" << ToString(candidate.legality.reason)
-                                  << " note=" << candidate.legality.debug_note << "\n";
+
+                    if (explored_states > max_states_per_seed) {
+                        ++rejected_candidates;
+                        ++local_reject_reasons[static_cast<size_t>(
+                            LegalityReason::kRuntimeBudgetExceeded)];
                     }
-                }
-            } else {
-                ++rejected_candidates;
-                ++reject_reasons_by_start[topo_idx][static_cast<size_t>(
-                    candidate.legality.reason)];
-                if (LegalityDebugEnabled()) {
-                    std::cerr << "  legality_reject start=" << topo_idx
-                              << " level=" << ToString(candidate.legality.failed_level)
-                              << " reason=" << ToString(candidate.legality.reason)
-                              << " note=" << candidate.legality.debug_note << "\n";
-                }
-            }
 
-            if (current_ops.size() >= max_group_size) {
-                continue;
-            }
-
-            const std::vector<size_t> frontier = CollectGrowthFrontier(
-                graph, current_ops, runtime.allow_predecessor_growth,
-                runtime.allow_successor_growth, runtime.max_frontier);
-
-            for (size_t next_op : frontier) {
-                if (global_queue_pushes >= runtime.total_queue_budget) {
-                    break;
+                    explored_states_by_start[topo_idx] = explored_states;
+                    accepted_candidates_by_start[topo_idx] = accepted_candidates;
+                    rejected_candidates_by_start[topo_idx] = rejected_candidates;
+                    reject_reasons_by_start[topo_idx] = local_reject_reasons;
                 }
-                std::vector<size_t> grown_ops = current_ops;
-                grown_ops.push_back(next_op);
-                const std::vector<size_t> canonical_ops = CandidateKeyFromOps(
-                    CanonicalizeOpSet(grown_ops, graph));
-                if (seen.insert(canonical_ops).second) {
-                    pending.push(canonical_ops);
-                    ++global_queue_pushes;
-                }
-            }
+            });
         }
-
-        explored_states_by_start[topo_idx] = explored_states;
-        accepted_candidates_by_start[topo_idx] = accepted_candidates;
-        rejected_candidates_by_start[topo_idx] = rejected_candidates;
+        for (auto& w : workers) w.join();
     }
 
     for (size_t start = 0; start < n; ++start) {
@@ -3238,6 +3420,116 @@ void AddAnalyticalTileCandidates(const Problem& problem,
                 EstimateProxyLatency(problem, graph, ops, boundary, g);
             if (std::isfinite(proxy_score)) {
                 proxy_ranked->push_back({proxy_score, g});
+            }
+        }
+    }
+}
+
+// Add roofline-knee tile candidates: tiles where compute_time == memory_time.
+//
+// AddAnalyticalTileCandidates finds the *largest* tile that fits in fast
+// memory (capacity-constrained). But for compute-bound workloads the optimal
+// tile is smaller — the one that balances compute and memory so neither is
+// idle. This function solves for that balance point.
+//
+// Roofline balance per tile (using the same buffer coefficients):
+//   compute(tw,th,k) = base_cost * (tw/nw) * (th/nk) * (k/nk)
+//   memory(tw,th,k)  = area_coeff*th*tw + (row_coeff*th + col_coeff*tw)*k
+//   balance: compute == memory / bw
+//
+// Substituting th = r*tw:
+//   base_cost * r * tw^2 / (nw*nh*nk) * k
+//       == (area_coeff*r*tw^2 + (row_coeff*r + col_coeff)*k*tw) / bw
+//
+// Rearranging to (A)*tw^2 + (B)*tw + (C) == 0:
+//   A = (base_cost*r*k/(nw*nh*nk)) - (area_coeff*r/bw)
+//   B = -(row_coeff*r + col_coeff)*k/bw
+//   C = 0      [constant term cancels]
+//
+// If A > 0 (compute-dominated at large tiles):
+//   knee tw = -B / A  (linear solve, no quadratic term)
+// If A < 0 (memory-dominated everywhere):
+//   no finite knee — skip (capacity-constrained tile is already optimal)
+// If A == 0: already balanced at all sizes — add the max-capacity tile only
+void AddMemoryBoundTileCandidates(
+    const Problem& problem, const OpGraph& graph,
+    const std::vector<size_t>& ops, const GroupBoundary& boundary,
+    const std::vector<int64_t>& k_steps,
+    std::vector<std::pair<double, Granularity>>* proxy_ranked) {
+    if (ops.empty() || proxy_ranked == nullptr) return;
+    if (!ContainsMatMul(problem, ops)) return;
+
+    const auto& ref_out = problem.tensors[problem.ops[ops.front()].outputs.front()];
+    const int64_t out_h = std::max<int64_t>(1, ref_out.height);
+    const int64_t out_w = std::max<int64_t>(1, ref_out.width);
+    const double bw = std::max<double>(
+        1.0, static_cast<double>(problem.slow_memory_bandwidth));
+    const int64_t native_w = std::max<int64_t>(1, problem.native_granularity.width);
+    const int64_t native_h = std::max<int64_t>(1, problem.native_granularity.height);
+    const int64_t native_k = std::max<int64_t>(1, problem.native_granularity.depth);
+
+    // Sum base_cost over all MatMul ops in the group.
+    double total_base_cost = 0.0;
+    for (size_t op_id : ops) {
+        if (IsMatMul(problem.ops[op_id])) {
+            total_base_cost += static_cast<double>(problem.ops[op_id].base_cost);
+        }
+    }
+    if (total_base_cost <= 0.0) return;
+
+    const TileBufferCoeffs coeffs =
+        ComputeBufferCoeffs(problem, graph, ops, boundary);
+
+    const double natural = static_cast<double>(out_h) / static_cast<double>(out_w);
+    std::vector<double> ratios = {natural, 1.0,
+                                  1.0 / natural, 0.5, 2.0};
+    std::sort(ratios.begin(), ratios.end());
+    ratios.erase(std::unique(ratios.begin(), ratios.end(),
+        [](double a, double b){ return std::abs(a-b) < 1e-9; }), ratios.end());
+
+    for (int64_t k_step : k_steps) {
+        if (k_step <= 0) continue;
+        const double k_d = static_cast<double>(k_step);
+        for (double r : ratios) {
+            if (r <= 0.0) continue;
+
+            // A = compute_slope - memory_area_slope (per tw^2)
+            // compute contributes: total_base_cost * r * k / (nw*nh*nk)
+            // memory area contributes: area_coeff * r / bw
+            const double compute_area =
+                total_base_cost * r * k_d /
+                (static_cast<double>(native_w) * static_cast<double>(native_h) *
+                 static_cast<double>(native_k));
+            const double memory_area = coeffs.area_coeff * r / bw;
+            const double A = compute_area - memory_area;
+
+            // B = -(row_coeff*r + col_coeff)*k / bw  (per tw, always <= 0)
+            const double B = -(coeffs.row_coeff * r + coeffs.col_coeff) * k_d / bw;
+
+            // If A <= 0: memory always >= compute at this ratio — no finite knee.
+            if (A <= 1e-12) continue;
+
+            // Knee: A*tw^2 + B*tw = 0  =>  tw = -B/A  (B <= 0, so tw >= 0)
+            const double tw_knee = -B / A;
+            if (tw_knee < 1.0) continue;
+
+            int64_t tile_w = std::min<int64_t>(
+                out_w, static_cast<int64_t>(tw_knee));
+            int64_t tile_h = std::min<int64_t>(
+                out_h,
+                std::max<int64_t>(1,
+                    static_cast<int64_t>(r * static_cast<double>(tile_w))));
+            tile_w = std::max<int64_t>(1, tile_w);
+
+            Granularity g{tile_w, tile_h, k_step};
+            const int64_t ws = EstimateWorkingSetBytes(
+                problem, graph, ops, boundary, g);
+            if (ws > problem.fast_memory_capacity) continue;
+
+            const double proxy = EstimateProxyLatency(
+                problem, graph, ops, boundary, g);
+            if (std::isfinite(proxy)) {
+                proxy_ranked->push_back({proxy, g});
             }
         }
     }
