@@ -97,35 +97,27 @@ Solve()
 
 ### Best config: `optimus_paper` + `seed` (with graph-cut decomposition)
 
-| Benchmark | N ops | Latency | Wall time | Key improvement |
-|---|---:|---:|---:|---|
-| mlsys-2026-1 | 5 | 405,875 | <1s | — |
-| mlsys-2026-5 | 19 | **650,528** | <1s | epilogue fusion [op5,6],[op10,11] + max-height gran fix |
-| mlsys-2026-9 | 32 | 164,506,000 | ~43s | graph-cut decomposition |
-| mlsys-2026-13 | 63 | 166,403,000 | ~9s | graph-cut decomposition |
-| mlsys-2026-17 | 103 | 46,338,000 | ~2s | graph-cut decomposition |
-
 Run with:
 ```bash
 MLSYS_SOLVER=optimus_paper MLSYS_OPTIMUS_CANDIDATES=seed ./build/mlsys benchmarks/mlsys-2026-N.json outputs/out-N.json
 ```
 
+### Performance vs. Baseline
+
+| Benchmark | N ops | Baseline | Current Best | Improvement | Cycles Saved |
+|---|---:|---:|---:|---:|---:|
+| mlsys-2026-1 | 5 | 471,500.80 | **405,875** | **-13.92%** | 65,626 |
+| mlsys-2026-5 | 19 | 1,013,623.47 | **650,528** | **-35.82%** | 363,095 |
+| mlsys-2026-9 | 32 | 167,530,987.52 | **164,506,000** | **-1.81%** | 3,024,988 |
+| mlsys-2026-13 | 63 | 166,414,742.80 | **166,403,000** | **-0.01%** | 11,743 |
+| mlsys-2026-17 | 103 | 46,441,850.88 | **46,338,000** | **-0.22%** | 103,851 |
+
 ### Key optimizations applied
 
 | Optimization | File | Effect |
 |---|---|---|
-| `BuildBestCandidate` forced max-height evaluation | `optimus.cpp` | Ensures optimal large-h/small-k tiles are always scored by accurate evaluator; fixed BM-5 by 2.2% |
+| `BuildBestCandidate` forced max-height evaluation | `optimus.cpp` | Ensures optimal large-h/small-k tiles are always scored by accurate evaluator; primary driver of BM-5 improvement |
 | Epilogue fusion [MatMul, Pointwise] | `optimus.cpp` (seed-growth candidates) | Fuses op5+op6, op10+op11 in BM-5; saves t15/t20 slow-mem round-trip |
 | Graph-cut decomposition | `optimus.cpp` | Splits large DAGs into independent segments; dramatically reduces wall time for BM-9/13/17 |
 | Frontier DP | `optimus.cpp` | Handles segments with N>20 ops that exceed bitmask DP limit |
 | Pre-op fusion (opt-in) | `optimus.cpp` | `MLSYS_ENABLE_PREOP_FUSION=1` allows [Pointwise, MatMul] pattern (disabled by default) |
-
-### Baseline: `optimus` + `interval`
-
-| Benchmark | Latency |
-|---|---:|
-| mlsys-2026-1 | 405,875 |
-| mlsys-2026-5 | 915,215 |
-| mlsys-2026-9 | 164,506,000 |
-| mlsys-2026-13 | 166,406,000 |
-| mlsys-2026-17 | 5,013,690 |
