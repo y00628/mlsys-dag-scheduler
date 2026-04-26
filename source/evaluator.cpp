@@ -690,9 +690,24 @@ bool RecomputeImpl(const Problem& problem, const Solution& input_solution,
         for (size_t tensor_id : boundary.boundary_inputs) {
             if (!Contains(retained_prev, tensor_id) &&
                 !Contains(slow_available, tensor_id)) {
+                std::cerr << "\n====================\n";
                 std::cerr << "ERROR: Subgraph " << sg_idx
                           << " needs tensor " << tensor_id
                           << " that is unavailable in fast or slow memory\n";
+                std::cerr << "  Subgraph op_ids: ";
+                for (auto op : sg.op_ids) std::cerr << op << " ";
+                std::cerr << "\n  tensors_to_retain: ";
+                for (auto t : sg.tensors_to_retain) std::cerr << t << " ";
+                std::cerr << "\n  boundary_inputs: ";
+                for (auto t : boundary.boundary_inputs) std::cerr << t << " ";
+                std::cerr << "\n  boundary_outputs: ";
+                for (auto t : boundary.boundary_outputs) std::cerr << t << " ";
+                std::cerr << "\n  tensor " << tensor_id << " producer: ";
+                int prod = graph.producer_of_tensor[tensor_id];
+                if (prod >= 0) std::cerr << prod; else std::cerr << "<input>";
+                std::cerr << "\n  tensor " << tensor_id << " consumers: ";
+                for (auto c : graph.consumers_of_tensor[tensor_id]) std::cerr << c << " ";
+                std::cerr << "\n====================\n";
                 return false;
             }
         }

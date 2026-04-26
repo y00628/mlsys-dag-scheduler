@@ -2710,18 +2710,18 @@ Solution BuildSolutionFromSchedule(
         Subgraph subgraph;
         subgraph.op_ids = candidate.ops;
         subgraph.granularity = candidate.granularity;
-        // Always retain all boundary outputs needed by the next subgraph
+        // Always retain all boundary outputs needed by the next subgraph (interval/seed-growth)
+        std::vector<size_t> must_retain;
         if (i + 1 < schedule.size()) {
             std::unordered_set<size_t> next_inputs(schedule[i + 1].boundary.boundary_inputs.begin(),
                                                   schedule[i + 1].boundary.boundary_inputs.end());
-            std::vector<size_t> must_retain;
             for (size_t t : candidate.boundary.boundary_outputs) {
                 if (next_inputs.count(t)) {
                     must_retain.push_back(t);
                 }
             }
-            subgraph.tensors_to_retain = must_retain;
         }
+        subgraph.tensors_to_retain = must_retain;
         subgraph.traversal_order = std::nullopt;
         GroupMetrics scored_metrics;
         if (!EvaluateWithOfficialScorer(problem, candidate.ops,
