@@ -271,7 +271,6 @@ struct SeedGrowthRuntimeConfig {
     size_t max_states_per_seed = 0;
     bool allow_predecessor_growth = true;
     bool allow_successor_growth = true;
-    bool require_contiguous_topo = false;
 };
 
 struct LegalityPolicyConfig {
@@ -419,8 +418,6 @@ SeedGrowthRuntimeConfig GetSeedGrowthRuntimeConfig() {
         "MLSYS_OPTIMUS_SEED_ALLOW_PRED", true);
     config.allow_successor_growth = ReadBoolEnvOrDefault(
         "MLSYS_OPTIMUS_SEED_ALLOW_SUCC", true);
-    config.require_contiguous_topo = ReadBoolEnvOrDefault(
-        "MLSYS_OPTIMUS_SEED_REQUIRE_CONTIGUOUS", false);
     if (!config.allow_predecessor_growth && !config.allow_successor_growth) {
         config.allow_successor_growth = true;
     }
@@ -1736,7 +1733,7 @@ CandidateGroup BuildBestCandidate(const Problem& problem, const OpGraph& graph,
             candidate.legality.level_passed = LegalityLevel::kL3Policy;
             candidate.legality.reason = LegalityReason::kNone;
             candidate.legality.failed_level = LegalityLevel::kL0Graph;
-            candidate.debug_tags = {"best_granularity_selected"};
+            /* debug_tags removed */
         }
     }
 
@@ -1901,7 +1898,8 @@ CandidateGroup BuildBestCandidateWithScheduler(
     for (size_t i = 0; i < budget; ++i) {
         GroupMetrics metrics = EvaluateGroup(problem, graph, candidate.ops,
                                              candidate.boundary,
-                                             proxy_ranked[i].second);
+                                             proxy_ranked[i].second,
+                                             &candidate.legality);
         if (!metrics.valid) {
             continue;
         }
@@ -2259,8 +2257,10 @@ std::vector<std::vector<CandidateGroup>> GenerateSeedGrowthCandidates(
             }
 
             if (candidate.metrics.valid) {
-                if (runtime.require_contiguous_topo &&
-                    !IsContiguousTopoSpan(graph, candidate)) {
+                // Reject if op set is not a single contiguous [start,end] in topo
+                // order, even when the env is turned off. Otherwise the partition DP
+                // can skip ops in the gap while advancing start past them.
+                if (!IsContiguousTopoSpan(graph, candidate)) {
                     candidate.legality.is_valid = false;
                     candidate.legality.level_passed = LegalityLevel::kL1Execution;
                     candidate.legality.failed_level = LegalityLevel::kL3Policy;
@@ -2703,24 +2703,39 @@ Solution BuildSolutionFromSchedule(
     Solution solution;
     std::vector<size_t> retained_inputs;
 
+    // Step 1: Find last producer subgraph for each tensor
+    std::unordered_map<size_t, size_t> last_producer_sg; // tensor_id -> subgraph idx
+    for (size_t i = 0; i < schedule.size(); ++i) {
+        const auto& candidate = schedule[i];
+        for (const auto& op_id : candidate.ops) {
+            for (size_t tensor_id : problem.ops[op_id].outputs) {
+                last_producer_sg[tensor_id] = i;
+            }
+        }
+    }
+
     for (size_t i = 0; i < schedule.size(); ++i) {
         const auto& candidate = schedule[i];
         const std::vector<size_t> incoming_used =
             FilterRetainedInputsForCandidate(candidate, retained_inputs);
+        // Find all tensors needed by later subgraphs
+        std::unordered_set<size_t> needed_later;
+        for (size_t j = i + 1; j < schedule.size(); ++j) {
+            for (size_t t : schedule[j].boundary.boundary_inputs) {
+                needed_later.insert(t);
+            }
+        }
+        // For each needed_later tensor, if this is the last producer, retain it here
+        std::vector<size_t> must_retain;
+        for (size_t t : needed_later) {
+            auto it = last_producer_sg.find(t);
+            if (it != last_producer_sg.end() && it->second == i) {
+                must_retain.push_back(t);
+            }
+        }
         Subgraph subgraph;
         subgraph.op_ids = candidate.ops;
         subgraph.granularity = candidate.granularity;
-        // Always retain all boundary outputs needed by the next subgraph (interval/seed-growth)
-        std::vector<size_t> must_retain;
-        if (i + 1 < schedule.size()) {
-            std::unordered_set<size_t> next_inputs(schedule[i + 1].boundary.boundary_inputs.begin(),
-                                                  schedule[i + 1].boundary.boundary_inputs.end());
-            for (size_t t : candidate.boundary.boundary_outputs) {
-                if (next_inputs.count(t)) {
-                    must_retain.push_back(t);
-                }
-            }
-        }
         subgraph.tensors_to_retain = must_retain;
         subgraph.traversal_order = std::nullopt;
         GroupMetrics scored_metrics;
@@ -2733,10 +2748,83 @@ Solution BuildSolutionFromSchedule(
         }
         subgraph.subgraph_latency = scored_metrics.latency;
         solution.subgraphs.push_back(std::move(subgraph));
-
         retained_inputs = solution.subgraphs.back().tensors_to_retain;
     }
 
+    return solution;
+}
+
+// Replay the partition DP’s per-step Retain() choices. BuildSolutionFromSchedule
+// recomputes must_retain from later groups’ boundary_inputs; that can differ from
+// the EnumerateRetainChoices decisions the DP already passed through
+// EvaluateWithOfficialScorer, yielding 0 valid subgraphs even when the search
+// memo says a feasible schedule exists.
+static Solution BuildSolutionFromScheduleWithDPRetention(
+        // Debug: print retain assignment for each subgraph
+        std::cerr << "[DEBUG] BuildSolutionFromScheduleWithDPRetention: schedule.size() = " << schedule.size() << "\n";
+        std::cerr << "[DEBUG] subgraph " << i << " ops: ";
+        for (auto op : candidate.ops) std::cerr << op << " ";
+        std::cerr << "\n[DEBUG] tensors_to_retain: ";
+        for (auto t : tensors_to_retain) std::cerr << t << " ";
+        std::cerr << "\n[DEBUG] boundary_inputs: ";
+        for (auto t : candidate.boundary.boundary_inputs) std::cerr << t << " ";
+        std::cerr << "\n[DEBUG] boundary_outputs: ";
+        for (auto t : candidate.boundary.boundary_outputs) std::cerr << t << " ";
+        std::cerr << "\n";
+    const Problem& problem,
+    const std::vector<CandidateGroup>& schedule,
+    const std::vector<std::vector<size_t>>& retain_after) {
+    Solution solution;
+    std::vector<size_t> retained_incoming;
+
+    // Precompute last producer for each tensor
+    std::unordered_map<size_t, size_t> last_producer_sg;
+    for (size_t i = 0; i < schedule.size(); ++i) {
+        const auto& candidate = schedule[i];
+        for (const auto& op_id : candidate.ops) {
+            for (size_t tensor_id : problem.ops[op_id].outputs) {
+                last_producer_sg[tensor_id] = i;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < schedule.size(); ++i) {
+        const auto& candidate = schedule[i];
+        const std::vector<size_t> incoming_used =
+            FilterRetainedInputsForCandidate(candidate, retained_incoming);
+        // Always union DP memo retain set with last-producer retain set
+        std::unordered_set<size_t> tensors_to_retain_set;
+        if (i < retain_after.size()) {
+            for (size_t t : retain_after[i]) tensors_to_retain_set.insert(t);
+        }
+        // Find all tensors needed by later subgraphs
+        std::unordered_set<size_t> needed_later;
+        for (size_t j = i + 1; j < schedule.size(); ++j) {
+            for (size_t t : schedule[j].boundary.boundary_inputs) {
+                needed_later.insert(t);
+            }
+        }
+        for (size_t t : needed_later) {
+            auto it = last_producer_sg.find(t);
+            if (it != last_producer_sg.end() && it->second == i) {
+                tensors_to_retain_set.insert(t);
+            }
+        }
+        std::vector<size_t> tensors_to_retain(tensors_to_retain_set.begin(), tensors_to_retain_set.end());
+        Subgraph subgraph;
+        subgraph.op_ids = candidate.ops;
+        subgraph.granularity = candidate.granularity;
+        subgraph.tensors_to_retain = tensors_to_retain;
+        subgraph.traversal_order = std::nullopt;
+        GroupMetrics scored_metrics;
+        if (!EvaluateWithOfficialScorer(problem, candidate.ops, candidate.granularity,
+                                        incoming_used, tensors_to_retain, &scored_metrics)) {
+            return Solution{};
+        }
+        subgraph.subgraph_latency = scored_metrics.latency;
+        solution.subgraphs.push_back(std::move(subgraph));
+        retained_incoming = tensors_to_retain;
+    }
     return solution;
 }
 
@@ -2746,6 +2834,7 @@ Solution BuildSolutionFromSearch(
     const std::vector<std::unordered_set<size_t>>& useful_inputs_by_start,
     const std::unordered_map<SearchStateKey, SearchDecision, SearchStateKeyHash>& memo) {
     std::vector<CandidateGroup> schedule;
+    std::vector<std::vector<size_t>> retain_after;
     size_t start = 0;
     std::vector<size_t> retained_inputs;
 
@@ -2759,11 +2848,15 @@ Solution BuildSolutionFromSearch(
             break;
         }
         schedule.push_back(candidates[start][it->second.candidate_index]);
+        retain_after.push_back(it->second.retained_outputs);
         retained_inputs = it->second.retained_outputs;
         start = schedule.back().end + 1;
     }
 
-    return BuildSolutionFromSchedule(problem, schedule);
+    if (schedule.empty()) {
+        return Solution{};
+    }
+    return BuildSolutionFromScheduleWithDPRetention(problem, schedule, retain_after);
 }
 
 // ============================================================================
@@ -3070,69 +3163,54 @@ double SolveBitmaskDPImpl(
     // Find the first uncovered op in topo order whose all predecessors are covered.
     int v0_topo_idx = -1;
     for (size_t i = 0; i < n; ++i) {
-        if ((covered >> i) & 1u) {
-            continue;
-        }
-        size_t op_id = graph.topo_order[i];
-        bool ready = true;
-        for (size_t pred : graph.preds[op_id]) {
-            if (!((covered >> graph.topo_pos[pred]) & 1u)) {
-                ready = false;
-                break;
-            }
-        }
-        if (ready) {
+        if ((covered & (1ULL << i)) == 0) {
             v0_topo_idx = static_cast<int>(i);
             break;
         }
     }
-    if (v0_topo_idx < 0) {
-        (*memo)[covered] = {};
+    if (v0_topo_idx == -1) {
+        (*memo)[covered] = BitmaskDecision{false, kInfinity, 0};
         return kInfinity;
     }
 
+    const auto& group_indices = groups_by_v0[v0_topo_idx];
     BitmaskDecision best;
-    if (static_cast<size_t>(v0_topo_idx) < groups_by_v0.size()) {
-        for (size_t group_idx : groups_by_v0[v0_topo_idx]) {
-            const BitmaskGroup& bg = groups[group_idx];
-            // Group must not overlap already-covered ops
-            if (bg.mask & covered) {
-                continue;
-            }
-            // All ops in group must be ready (their preds are covered or internal)
-            bool group_ready = true;
-            for (size_t i = 0; i < n; ++i) {
-                if (!((bg.mask >> i) & 1u)) {
-                    continue;
-                }
-                size_t op_id = graph.topo_order[i];
-                for (size_t pred : graph.preds[op_id]) {
-                    size_t pred_topo = graph.topo_pos[pred];
-                    if (!((covered >> pred_topo) & 1u) &&
-                        !((bg.mask >> pred_topo) & 1u)) {
-                        group_ready = false;
-                        break;
-                    }
-                }
-                if (!group_ready) {
+    best.valid = false;
+    best.cost = kInfinity;
+    best.group_idx = 0;
+
+    for (size_t group_idx : group_indices) {
+        const auto& bg = groups[group_idx];
+        // Check if group is available (all ops in group are uncovered)
+        if ((bg.mask & covered) != 0) {
+            continue;
+        }
+        // Check if all predecessors of group ops are covered
+        bool group_ready = true;
+        for (size_t op_id : bg.candidate.ops) {
+            for (size_t pred : graph.preds[op_id]) {
+                if ((covered & (1ULL << graph.topo_pos[pred])) == 0 &&
+                    (bg.mask & (1ULL << graph.topo_pos[pred])) == 0) {
+                    group_ready = false;
                     break;
                 }
             }
-            if (!group_ready) {
-                continue;
-            }
+            if (!group_ready) break;
+        }
+        if (!group_ready) {
+            continue;
+        }
 
-            const double group_cost = bg.candidate.metrics.latency;
-            const uint64_t new_covered = covered | bg.mask;
-            const double future = SolveBitmaskDPImpl(
-                problem, graph, groups, groups_by_v0, n,
-                new_covered, full_mask, memo);
-            const double total = group_cost + future;
-            if (total < best.cost) {
-                best.valid     = true;
-                best.cost      = total;
-                best.group_idx = group_idx;
-            }
+        const double group_cost = bg.candidate.metrics.latency;
+        const uint64_t new_covered = covered | bg.mask;
+        const double future = SolveBitmaskDPImpl(
+            problem, graph, groups, groups_by_v0, n,
+            new_covered, full_mask, memo);
+        const double total = group_cost + future;
+        if (total < best.cost) {
+            best.valid     = true;
+            best.cost      = total;
+            best.group_idx = group_idx;
         }
     }
 

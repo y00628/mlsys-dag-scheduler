@@ -1,0 +1,17 @@
+Loaded problem from: benchmarks/mlsys-2026-5.json
+Problem: 29 tensors, 19 ops, fast_mem=30000, slow_bw=15
+Solver backend: optimus
+Optimus candidates: seed-growth
+Solution: 5 subgraphs
+
+====================
+ERROR: Subgraph 1 needs tensor 12 that is unavailable in fast or slow memory
+  Subgraph op_ids: 3 4 
+  tensors_to_retain: 
+  boundary_inputs: 0 7 12 
+  boundary_outputs: 14 
+  tensor 12 producer: 2
+  tensor 12 consumers: 4 
+====================
+ERROR: Solution is invalid!
+Solution written to: outputs/out.json
